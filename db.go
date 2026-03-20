@@ -178,6 +178,15 @@ func (db *DB) UpdateSiteResult(id int64, status SiteStatus, errorCode, errorMsg 
 	return err
 }
 
+// RevertToPending puts a site back to pending without incrementing check_count.
+// Used when a check failed due to infrastructure issues (Chrome can't start), not site problems.
+func (db *DB) RevertToPending(id int64) error {
+	_, err := db.conn.Exec(`
+		UPDATE sites SET status = 'pending', updated_at = NOW() WHERE id = $1
+	`, id)
+	return err
+}
+
 // GetWorkingSites returns all sites with status "working".
 func (db *DB) GetWorkingSites(limit, offset int) ([]Site, int, error) {
 	var total int

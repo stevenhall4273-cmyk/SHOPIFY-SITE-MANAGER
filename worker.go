@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -32,7 +33,7 @@ func (w *SiteCheckWorker) Run(stop <-chan struct{}) {
 		log.Printf("[worker] Reset %d stuck sites back to pending", n)
 	}
 
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -94,9 +95,36 @@ func (w *SiteCheckWorker) processBatch() {
 		return
 	}
 
+	// Check if the entire batch was a Chrome infrastructure failure
+	// (e.g. "Cannot fork", "resource temporarily unavailable")
+	infraFailCount := 0
+	for _, r := range results {
+		if isInfraError(r.ErrorMessage) {
+			infraFailCount++
+		}
+	}
+
+	if infraFailCount == len(results) {
+		// ALL checks failed due to Chrome infra — revert ALL sites to pending
+		// without incrementing check_count, then back off
+		log.Printf("[worker] ⛔ Chrome cannot start — reverting %d sites to pending, backing off 30s", len(sites))
+		for _, site := range sites {
+			w.db.RevertToPending(site.ID)
+		}
+		time.Sleep(30 * time.Second)
+		return
+	}
+
 	// Process results
 	for i, r := range results {
 		site := sites[i]
+
+		// If this specific result is a Chrome infra error, revert without penalty
+		if isInfraError(r.ErrorMessage) {
+			log.Printf("[worker] ⚠️ CHROME ERROR (no penalty): %s", site.URL)
+			w.db.RevertToPending(site.ID)
+			continue
+		}
 
 		switch {
 		case r.ErrorCode == "INCORRECT_NUMBER" || r.ErrorCode == "INVALID_PAYMENT_METHOD":
@@ -131,4 +159,14 @@ func (w *SiteCheckWorker) processBatch() {
 			}
 		}
 	}
+}
+
+// isInfraError returns true if the error is a Chrome/OS infrastructure failure,
+// not a site-specific problem.
+func isInfraError(errMsg string) bool {
+	lower := strings.ToLower(errMsg)
+	return strings.Contains(lower, "failed to init tab") ||
+		strings.Contains(lower, "cannot fork") ||
+		strings.Contains(lower, "resource temporarily unavailable") ||
+		strings.Contains(lower, "chrome failed to start")
 }

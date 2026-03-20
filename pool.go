@@ -9,22 +9,18 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
-// ChromePool manages a pool of persistent headless Chrome allocators.
-// Each allocator is a separate Chrome process that can host multiple tabs.
+// ChromePool manages on-demand headless Chrome allocators.
+// Chrome processes are created per-batch and closed after to prevent zombie buildup.
 type ChromePool struct {
-	allocators []context.Context
-	cancels    []context.CancelFunc
-	mu         sync.Mutex
-	busy       bool // true while a batch is running
+	size int
+	opts []chromedp.ExecAllocatorOption
+	mu   sync.Mutex
+	busy bool // true while a batch is running
 }
 
-// NewChromePool creates n headless Chrome processes.
+// NewChromePool creates a pool config for n concurrent Chrome processes.
+// Chrome processes are created on demand per batch, not prewarmed.
 func NewChromePool(n int) *ChromePool {
-	pool := &ChromePool{
-		allocators: make([]context.Context, n),
-		cancels:    make([]context.CancelFunc, n),
-	}
-
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", true),
 		chromedp.Flag("no-sandbox", true),
@@ -41,32 +37,14 @@ func NewChromePool(n int) *ChromePool {
 		chromedp.WindowSize(1366, 768),
 	)
 
-	for i := 0; i < n; i++ {
-		allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
-		pool.allocators[i] = allocCtx
-		pool.cancels[i] = allocCancel
-
-		// Warm up each allocator by creating and closing a tab
-		tabCtx, tabCancel := chromedp.NewContext(allocCtx)
-		chromedp.Run(tabCtx, chromedp.Navigate("about:blank"))
-		tabCancel()
-
-		fmt.Printf("Chrome process %d/%d ready\n", i+1, n)
-	}
-
-	return pool
+	fmt.Printf("Chrome pool configured for %d concurrent processes (on-demand)\n", n)
+	return &ChromePool{size: n, opts: opts}
 }
 
-// Close shuts down all Chrome processes.
-func (p *ChromePool) Close() {
-	for _, cancel := range p.cancels {
-		cancel()
-	}
-}
+// Close is a no-op since Chrome processes are now created/destroyed per batch.
+func (p *ChromePool) Close() {}
 
-// RunBatch runs all card entries in parallel across the pool.
-// Cards are distributed round-robin across allocators.
-// Each allocator runs its assigned cards concurrently (one tab per card).
+// RunBatch creates fresh Chrome process(es), runs all entries, then cleans up.
 // Returns results in the same order as the input.
 func (p *ChromePool) RunBatch(entries []CardEntry, buyer BuyerInfo, perStoreLimit int) ([]CheckResult, error) {
 	p.mu.Lock()
@@ -91,8 +69,23 @@ func (p *ChromePool) RunBatch(entries []CardEntry, buyer BuyerInfo, perStoreLimi
 		sems:  make(map[string]chan struct{}),
 	}
 
-	// Distribute cards round-robin across allocators
-	numAlloc := len(p.allocators)
+	// Create fresh Chrome allocators for this batch
+	numAlloc := p.size
+	if numAlloc > n {
+		numAlloc = n
+	}
+	allocators := make([]context.Context, numAlloc)
+	cancels := make([]context.CancelFunc, numAlloc)
+	for i := 0; i < numAlloc; i++ {
+		allocators[i], cancels[i] = chromedp.NewExecAllocator(context.Background(), p.opts...)
+	}
+	// Always clean up Chrome processes after batch
+	defer func() {
+		for _, cancel := range cancels {
+			cancel()
+		}
+	}()
+
 	var wg sync.WaitGroup
 
 	for i, entry := range entries {
@@ -118,7 +111,7 @@ func (p *ChromePool) RunBatch(entries []CardEntry, buyer BuyerInfo, perStoreLimi
 			results[idx] = runCheckout(tabCtx, e, buyer)
 			fmt.Printf("[%d/%s] DONE — %s (%s) in %.1fs\n",
 				e.Index, e.Card.Last4, results[idx].Status, results[idx].ErrorCode, results[idx].ElapsedSeconds)
-		}(i, entry, p.allocators[allocIdx])
+		}(i, entry, allocators[allocIdx])
 	}
 
 	wg.Wait()

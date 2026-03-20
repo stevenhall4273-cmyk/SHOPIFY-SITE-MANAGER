@@ -11,7 +11,7 @@ import (
 
 func main() {
 	// Number of Chrome processes (each handles ~10 tabs)
-	numChrome := 10
+	numChrome := 3
 	if v := os.Getenv("CHROME_POOL_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			numChrome = n
@@ -48,7 +48,7 @@ func main() {
 	// Start background site check worker if DB is available
 	stopWorker := make(chan struct{})
 	if db != nil {
-		worker := NewSiteCheckWorker(db, pool)
+		worker := NewSiteCheckWorker(db, pool, numChrome)
 		go worker.Run(stopWorker)
 		fmt.Println("Site check worker started")
 	}

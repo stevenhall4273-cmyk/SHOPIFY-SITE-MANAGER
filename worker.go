@@ -9,13 +9,18 @@ import (
 // SiteCheckWorker continuously pulls pending sites from the DB,
 // checks them using the Chrome pool, and writes results back.
 type SiteCheckWorker struct {
-	db   *DB
-	pool *ChromePool
+	db        *DB
+	pool      *ChromePool
+	batchSize int
 }
 
 // NewSiteCheckWorker creates a background worker that checks sites.
-func NewSiteCheckWorker(db *DB, pool *ChromePool) *SiteCheckWorker {
-	return &SiteCheckWorker{db: db, pool: pool}
+// batchSize controls how many sites to check per tick (should match pool size).
+func NewSiteCheckWorker(db *DB, pool *ChromePool, batchSize int) *SiteCheckWorker {
+	if batchSize <= 0 {
+		batchSize = 3
+	}
+	return &SiteCheckWorker{db: db, pool: pool, batchSize: batchSize}
 }
 
 // Run starts the worker loop. Call in a goroutine.
@@ -47,8 +52,7 @@ func (w *SiteCheckWorker) processBatch() {
 		log.Printf("[worker] Reset %d stuck sites", n)
 	}
 
-	// Grab up to 5 sites at once (conservative to avoid overloading)
-	sites, err := w.db.ClaimPendingSites(5)
+	sites, err := w.db.ClaimPendingSites(w.batchSize)
 	if err != nil {
 		log.Printf("[worker] Error claiming sites: %v", err)
 		return

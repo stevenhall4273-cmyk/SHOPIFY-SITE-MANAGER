@@ -32,7 +32,7 @@ func (w *SiteCheckWorker) Run(stop <-chan struct{}) {
 		log.Printf("[worker] Reset %d stuck sites back to pending", n)
 	}
 
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -99,9 +99,9 @@ func (w *SiteCheckWorker) processBatch() {
 		site := sites[i]
 
 		switch {
-		case r.ErrorCode == "INCORRECT_NUMBER":
-			// WORKING — the checkout is live, it tried to charge the card
-			log.Printf("[worker] ✅ WORKING: %s ($%.2f)", site.URL, r.CheckoutPrice)
+		case r.ErrorCode == "INCORRECT_NUMBER" || r.ErrorCode == "INVALID_PAYMENT_METHOD":
+			// WORKING — the checkout is live, it tried to process the card
+			log.Printf("[worker] ✅ WORKING: %s ($%.2f) (%s)", site.URL, r.CheckoutPrice, r.ErrorCode)
 			w.db.UpdateSiteResult(site.ID, StatusWorking, r.ErrorCode, r.ErrorMessage, r.CheckoutPrice)
 
 		case r.ErrorCode == "CHECKOUT_FAILED" || r.ErrorCode == "PAYMENT_FILL_FAILED":
@@ -114,8 +114,8 @@ func (w *SiteCheckWorker) processBatch() {
 			log.Printf("[worker] ⚠️ ERROR (will retry): %s (%s)", site.URL, r.ErrorCode)
 			w.db.UpdateSiteResult(site.ID, StatusError, r.ErrorCode, r.ErrorMessage, r.CheckoutPrice)
 
-		case r.Status == "declined" && r.ErrorCode != "INCORRECT_NUMBER":
-			// Some other decline — checkout works but different error
+		case r.Status == "declined":
+			// Any other decline — checkout works but different error
 			// Still means the site is alive enough to reach payment
 			log.Printf("[worker] ✅ WORKING (declined): %s ($%.2f) (%s)", site.URL, r.CheckoutPrice, r.ErrorCode)
 			w.db.UpdateSiteResult(site.ID, StatusWorking, r.ErrorCode, r.ErrorMessage, r.CheckoutPrice)

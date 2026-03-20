@@ -111,8 +111,8 @@ func (p *ChromePool) RunBatch(entries []CardEntry, buyer BuyerInfo, perStoreLimi
 			tabCtx, tabCancel := chromedp.NewContext(allocCtx)
 			defer tabCancel()
 
-			// Per-tab timeout
-			tabCtx, timeoutCancel := context.WithTimeout(tabCtx, 120*time.Second)
+			// Per-tab timeout (keep short — dead sites waste time)
+			tabCtx, timeoutCancel := context.WithTimeout(tabCtx, 45*time.Second)
 			defer timeoutCancel()
 
 			results[idx] = runCheckout(tabCtx, e, buyer)

@@ -123,6 +123,59 @@ def extract_shopify_urls(text: str) -> set[str]:
 
 
 # ── API client ──────────────────────────────────────────────────────
+def get_stats() -> dict | None:
+    """Fetch site stats from the checker API. Returns None on failure."""
+    headers = {}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+    try:
+        resp = requests.get(
+            f"{CHECKER_URL}/sites/stats",
+            headers=headers,
+            timeout=15,
+            verify=False,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"⚠️ Could not fetch stats: {e}")
+        return None
+
+
+# Percentage of total sites that must be checked before scraper runs again
+CHECK_THRESHOLD = float(os.environ.get("CHECK_THRESHOLD", "0.70"))
+
+
+def wait_for_checker():
+    """Block until the checker has processed >= 70% of total sites (or DB is empty)."""
+    while True:
+        stats = get_stats()
+        if stats is None:
+            print("⏳ Cannot reach checker API, retrying in 30s...")
+            time.sleep(30)
+            continue
+
+        total = stats.get("total", 0)
+        by_status = stats.get("by_status", {})
+        pending = by_status.get("pending", 0)
+        checking = by_status.get("checking", 0)
+        unchecked = pending + checking
+
+        if total == 0:
+            print("📭 No sites in DB yet — scraper will run")
+            return
+
+        checked_pct = (total - unchecked) / total
+        print(f"📊 Sites: {total} total | {unchecked} unchecked | {checked_pct:.0%} checked")
+
+        if checked_pct >= CHECK_THRESHOLD:
+            print(f"✅ {checked_pct:.0%} >= {CHECK_THRESHOLD:.0%} threshold — scraper resuming")
+            return
+
+        print(f"⏸️ Only {checked_pct:.0%} checked (need {CHECK_THRESHOLD:.0%}) — waiting 60s...")
+        time.sleep(60)
+
+
 def submit_sites(urls: list[str]) -> dict:
     """POST discovered sites to the checker API."""
     if not urls:
@@ -236,6 +289,7 @@ def main():
     print(f"   Searches per cycle: {SEARCHES_PER_CYCLE}")
     print(f"   Batch size: {BATCH_SIZE}")
     print(f"   Cycle delay: {CYCLE_DELAY}s")
+    print(f"   Check threshold: {CHECK_THRESHOLD:.0%}")
 
     # Verify connectivity
     try:
@@ -254,6 +308,11 @@ def main():
 
     while True:
         cycle += 1
+
+        # Wait until checker has processed enough sites before scraping more
+        print(f"\n⏳ Checking if checker has caught up...")
+        wait_for_checker()
+
         print(f"\n{'='*50}")
         print(f"📡 Cycle {cycle} — Starting Tempest scrape...")
         print(f"{'='*50}")

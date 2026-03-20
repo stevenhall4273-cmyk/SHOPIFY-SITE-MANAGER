@@ -31,6 +31,9 @@ func RegisterSiteRoutes(mux *http.ServeMux, db *DB) {
 	mux.HandleFunc("/sites/export", func(w http.ResponseWriter, r *http.Request) {
 		handleExport(w, r, db)
 	})
+	mux.HandleFunc("/sites/dashboard", func(w http.ResponseWriter, r *http.Request) {
+		handleDashboard(w, r, db)
+	})
 }
 
 func checkAuth(r *http.Request) bool {
@@ -182,4 +185,102 @@ func handleExport(w http.ResponseWriter, r *http.Request, db *DB) {
 	for _, s := range sites {
 		fmt.Fprintf(w, "%s | $%.2f\n", s.URL, s.CheckoutPrice)
 	}
+}
+
+// GET /sites/dashboard — HTML page showing stats and working sites
+func handleDashboard(w http.ResponseWriter, r *http.Request, db *DB) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	stats, err := db.GetStats()
+	if err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+	total := 0
+	for _, v := range stats {
+		total += v
+	}
+
+	sites, workingTotal, err := db.GetWorkingSites(500, 0)
+	if err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Shopify Site Manager</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+.container{max-width:1100px;margin:0 auto;padding:24px}
+h1{font-size:1.8rem;margin-bottom:24px;color:#f8fafc}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:32px}
+.stat{background:#1e293b;border-radius:12px;padding:18px;text-align:center;border:1px solid #334155}
+.stat .num{font-size:2rem;font-weight:700;color:#38bdf8}
+.stat .label{font-size:.82rem;color:#94a3b8;margin-top:4px}
+.stat.working .num{color:#4ade80}
+.stat.dead .num{color:#f87171}
+.stat.pending .num{color:#facc15}
+.stat.error .num{color:#fb923c}
+table{width:100%;border-collapse:collapse;background:#1e293b;border-radius:12px;overflow:hidden;border:1px solid #334155}
+th{background:#334155;padding:12px 16px;text-align:left;font-size:.82rem;text-transform:uppercase;letter-spacing:.05em;color:#94a3b8}
+td{padding:10px 16px;border-top:1px solid #1e293b;font-size:.9rem}
+tr:nth-child(even){background:#1e293b}
+tr:nth-child(odd){background:#0f172a}
+tr:hover{background:#334155}
+a{color:#38bdf8;text-decoration:none}
+a:hover{text-decoration:underline}
+.price{color:#4ade80;font-weight:600}
+.badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:.75rem;font-weight:600}
+.badge.working{background:#065f46;color:#4ade80}
+.empty{text-align:center;padding:48px;color:#64748b;font-size:1.1rem}
+.refresh{margin-bottom:16px;text-align:right}
+.refresh a{background:#334155;padding:8px 16px;border-radius:8px;color:#e2e8f0;font-size:.85rem}
+.refresh a:hover{background:#475569;text-decoration:none}
+h2{font-size:1.2rem;margin-bottom:12px;color:#f8fafc}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>🏪 Shopify Site Manager</h1>
+<div class="stats">`)
+
+	fmt.Fprintf(w, `<div class="stat"><div class="num">%d</div><div class="label">Total Sites</div></div>`, total)
+	fmt.Fprintf(w, `<div class="stat working"><div class="num">%d</div><div class="label">Working</div></div>`, stats["working"])
+	fmt.Fprintf(w, `<div class="stat pending"><div class="num">%d</div><div class="label">Pending</div></div>`, stats["pending"])
+	fmt.Fprintf(w, `<div class="stat"><div class="num">%d</div><div class="label">Checking</div></div>`, stats["checking"])
+	fmt.Fprintf(w, `<div class="stat dead"><div class="num">%d</div><div class="label">Dead</div></div>`, stats["dead"])
+	fmt.Fprintf(w, `<div class="stat error"><div class="num">%d</div><div class="label">Errors</div></div>`, stats["error"])
+
+	fmt.Fprint(w, `</div>
+<div class="refresh"><a href="/sites/dashboard">↻ Refresh</a> &nbsp; <a href="/sites/export">⬇ Export TXT</a></div>`)
+
+	fmt.Fprintf(w, `<h2>Working Sites (%d)</h2>`, workingTotal)
+
+	if len(sites) == 0 {
+		fmt.Fprint(w, `<div class="empty">No working sites found yet. The checker is still processing.</div>`)
+	} else {
+		fmt.Fprint(w, `<table><thead><tr><th>#</th><th>Store URL</th><th>Price</th><th>Last Checked</th></tr></thead><tbody>`)
+		for i, s := range sites {
+			lastChecked := "—"
+			if s.LastChecked != nil {
+				lastChecked = s.LastChecked.Format("Jan 02 15:04")
+			}
+			fmt.Fprintf(w, `<tr><td>%d</td><td><a href="%s" target="_blank" rel="noopener">%s</a></td><td class="price">$%.2f</td><td>%s</td></tr>`,
+				i+1, s.URL, s.URL, s.CheckoutPrice, lastChecked)
+		}
+		fmt.Fprint(w, `</tbody></table>`)
+	}
+
+	fmt.Fprint(w, `</div>
+<script>setTimeout(()=>location.reload(),30000)</script>
+</body></html>`)
 }

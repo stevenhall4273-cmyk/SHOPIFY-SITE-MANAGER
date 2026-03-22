@@ -17,7 +17,7 @@ type SiteStatus string
 const (
 	StatusPending  SiteStatus = "pending"  // discovered, not yet checked
 	StatusChecking SiteStatus = "checking" // currently being checked
-	StatusWorking  SiteStatus = "working"  // returned INCORRECT_NUMBER → site is live
+	StatusWorking  SiteStatus = "working"  // returned a real decline, so checkout flow is live
 	StatusDead     SiteStatus = "dead"     // checkout failed (no products, blocked, etc.)
 	StatusError    SiteStatus = "error"    // transient error, will retry
 )

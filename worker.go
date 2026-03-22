@@ -10,8 +10,8 @@ import (
 )
 
 // SiteCheckWorker continuously pulls pending sites from the DB and runs
-// a full checkout with a test card. If the site returns INCORRECT_NUMBER,
-// the checkout flow works → site is marked working.
+// a full checkout with a test card. If the site returns a real card decline,
+// the checkout flow works and the site is marked working.
 type SiteCheckWorker struct {
 	db        *DB
 	browser   *Browser
@@ -88,7 +88,7 @@ func (w *SiteCheckWorker) processBatch() {
 }
 
 // checkSite runs a full checkout with a test card via the browser.
-// INCORRECT_NUMBER means the checkout flow works end-to-end → site is working.
+// Real decline codes mean the checkout flow works end-to-end → site is working.
 func (w *SiteCheckWorker) checkSite(site Site) {
 	storeURL := site.URL
 	buyer := DefaultBuyer()
@@ -126,11 +126,11 @@ func (w *SiteCheckWorker) checkSite(site Site) {
 	result := runCheckout(page, entry, buyer)
 	log.Printf("[worker] %s → %s (%s) in %.1fs", storeURL, result.Status, result.ErrorCode, result.ElapsedSeconds)
 
-	// INCORRECT_NUMBER or CARD_DECLINED = checkout flow works, site is valid
-	if result.ErrorCode == "INCORRECT_NUMBER" || result.ErrorCode == "CARD_DECLINED" {
+	// Real decline codes mean checkout flow works, so keep the site.
+	if result.ErrorCode == "INCORRECT_NUMBER" || result.ErrorCode == "CARD_DECLINED" || result.ErrorCode == "GENERIC_ERROR" {
 		price := result.CheckoutPrice
-		log.Printf("[worker] WORKING: %s ($%.2f)", storeURL, price)
-		w.db.UpdateSiteResult(site.ID, StatusWorking, "CHECKOUT_VERIFIED", fmt.Sprintf("full checkout works ($%.2f)", price), price)
+		log.Printf("[worker] WORKING: %s (%s, $%.2f)", storeURL, result.ErrorCode, price)
+		w.db.UpdateSiteResult(site.ID, StatusWorking, result.ErrorCode, fmt.Sprintf("full checkout works (%s, $%.2f)", result.ErrorCode, price), price)
 		return
 	}
 

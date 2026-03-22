@@ -240,6 +240,30 @@ func handleDashboard(w http.ResponseWriter, r *http.Request, db *DB) {
 		return
 	}
 
+	// Dashboard supports pagination and full list mode:
+	// - /sites/dashboard?limit=500&offset=0
+	// - /sites/dashboard?all=1
+	limit := 500
+	offset := 0
+	showAll := r.URL.Query().Get("all") == "1"
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	queryLower := strings.ToLower(query)
+	if showAll {
+		limit = 10000
+		offset = 0
+	} else {
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1000 {
+				limit = n
+			}
+		}
+		if v := r.URL.Query().Get("offset"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+				offset = n
+			}
+		}
+	}
+
 	stats, err := db.GetStats()
 	if err != nil {
 		http.Error(w, "database error", http.StatusInternalServerError)
@@ -250,11 +274,60 @@ func handleDashboard(w http.ResponseWriter, r *http.Request, db *DB) {
 		total += v
 	}
 
-	sites, workingTotal, err := db.GetWorkingSites(500, 0)
-	if err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
+	var sites []Site
+	var workingTotal int
+	if queryLower != "" {
+		// Search mode: query is matched against all working site URLs.
+		allWorking, _, err := db.GetWorkingSites(10000, 0)
+		if err != nil {
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
+		filtered := make([]Site, 0, len(allWorking))
+		for _, s := range allWorking {
+			if strings.Contains(strings.ToLower(s.URL), queryLower) {
+				filtered = append(filtered, s)
+			}
+		}
+		workingTotal = len(filtered)
+		if showAll {
+			sites = filtered
+			offset = 0
+		} else {
+			if offset > workingTotal {
+				offset = 0
+			}
+			endIdx := offset + limit
+			if endIdx > workingTotal {
+				endIdx = workingTotal
+			}
+			if offset < endIdx {
+				sites = filtered[offset:endIdx]
+			} else {
+				sites = []Site{}
+			}
+		}
+	} else {
+		sites, workingTotal, err = db.GetWorkingSites(limit, offset)
+		if err != nil {
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
 	}
+
+	start := 0
+	end := 0
+	if len(sites) > 0 {
+		start = offset + 1
+		end = offset + len(sites)
+	}
+	prevOffset := offset - limit
+	if prevOffset < 0 {
+		prevOffset = 0
+	}
+	nextOffset := offset + limit
+	hasPrev := offset > 0
+	hasNext := nextOffset < workingTotal
 
 	under15, _ := db.CountWorkingUnder15()
 
@@ -293,6 +366,10 @@ a:hover{text-decoration:underline}
 .refresh{margin-bottom:16px;text-align:right}
 .refresh a{background:#334155;padding:8px 16px;border-radius:8px;color:#e2e8f0;font-size:.85rem}
 .refresh a:hover{background:#475569;text-decoration:none}
+.search{margin:0 0 12px 0;display:flex;gap:8px;flex-wrap:wrap}
+.search input{min-width:280px;max-width:520px;flex:1;background:#0f172a;border:1px solid #334155;color:#e2e8f0;border-radius:8px;padding:10px 12px}
+.search button{background:#334155;color:#e2e8f0;border:none;border-radius:8px;padding:10px 14px;cursor:pointer}
+.search button:hover{background:#475569}
 .btn-recheck{background:#7c3aed!important;color:#fff!important}
 .btn-recheck:hover{background:#6d28d9!important}
 .btn-del{background:#dc2626;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:.8rem}
@@ -316,10 +393,50 @@ h2{font-size:1.2rem;margin-bottom:12px;color:#f8fafc}
 	fmt.Fprint(w, `</div>
 <div class="refresh">
 <a href="/sites/dashboard">↻ Refresh</a> &nbsp; <a href="/sites/export">⬇ Export TXT</a> &nbsp;
+<a href="/sites/dashboard?all=1">👁 Show All</a> &nbsp;
+<a href="/sites/dashboard?limit=500&offset=0">📄 Paged View</a> &nbsp;
 <a href="#" onclick="recheckAll(); return false;" class="btn-recheck">🔄 Recheck All Sites</a>
 </div>`)
 
+	fmt.Fprint(w, `<form class="search" method="GET" action="/sites/dashboard">`)
+	if showAll {
+		fmt.Fprint(w, `<input type="hidden" name="all" value="1">`)
+	} else {
+		fmt.Fprintf(w, `<input type="hidden" name="limit" value="%d">`, limit)
+	}
+	fmt.Fprintf(w, `<input type="text" name="q" value="%s" placeholder="Search store URL (e.g. favoryt-brand)">`, query)
+	fmt.Fprint(w, `<button type="submit">Search</button>`)
+	if queryLower != "" {
+		if showAll {
+			fmt.Fprint(w, `<a href="/sites/dashboard?all=1" style="display:inline-block;background:#334155;padding:10px 14px;border-radius:8px;color:#e2e8f0;text-decoration:none;">Clear</a>`)
+		} else {
+			fmt.Fprintf(w, `<a href="/sites/dashboard?limit=%d&offset=0" style="display:inline-block;background:#334155;padding:10px 14px;border-radius:8px;color:#e2e8f0;text-decoration:none;">Clear</a>`, limit)
+		}
+	}
+	fmt.Fprint(w, `</form>`)
+
 	fmt.Fprintf(w, `<h2>Working Sites (%d)</h2>`, workingTotal)
+	if showAll {
+		if queryLower != "" {
+			fmt.Fprintf(w, `<div style="margin-bottom:10px;color:#94a3b8;font-size:.9rem;">Showing all %d matching sites for "%s"</div>`, workingTotal, query)
+		} else {
+			fmt.Fprintf(w, `<div style="margin-bottom:10px;color:#94a3b8;font-size:.9rem;">Showing all %d sites</div>`, workingTotal)
+		}
+	} else {
+		if queryLower != "" {
+			fmt.Fprintf(w, `<div style="margin-bottom:10px;color:#94a3b8;font-size:.9rem;">Showing %d-%d of %d matching sites for "%s"</div>`, start, end, workingTotal, query)
+		} else {
+			fmt.Fprintf(w, `<div style="margin-bottom:10px;color:#94a3b8;font-size:.9rem;">Showing %d-%d of %d</div>`, start, end, workingTotal)
+		}
+		fmt.Fprint(w, `<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap;">`)
+		if hasPrev {
+			fmt.Fprintf(w, `<a href="/sites/dashboard?limit=%d&offset=%d&q=%s" style="background:#334155;padding:8px 12px;border-radius:8px;color:#e2e8f0;text-decoration:none;">← Prev</a>`, limit, prevOffset, query)
+		}
+		if hasNext {
+			fmt.Fprintf(w, `<a href="/sites/dashboard?limit=%d&offset=%d&q=%s" style="background:#334155;padding:8px 12px;border-radius:8px;color:#e2e8f0;text-decoration:none;">Next →</a>`, limit, nextOffset, query)
+		}
+		fmt.Fprint(w, `</div>`)
+	}
 
 	if len(sites) == 0 {
 		fmt.Fprint(w, `<div class="empty">No working sites found yet. The checker is still processing.</div>`)
@@ -331,7 +448,7 @@ h2{font-size:1.2rem;margin-bottom:12px;color:#f8fafc}
 				lastChecked = s.LastChecked.Format("Jan 02 15:04")
 			}
 			fmt.Fprintf(w, `<tr><td>%d</td><td><a href="%s" target="_blank" rel="noopener">%s</a></td><td class="price">$%.2f</td><td>%s</td><td><button class="btn-del" onclick="deleteSite(%d, this)">✕</button></td></tr>`,
-				i+1, s.URL, s.URL, s.CheckoutPrice, lastChecked, s.ID)
+				offset+i+1, s.URL, s.URL, s.CheckoutPrice, lastChecked, s.ID)
 		}
 		fmt.Fprint(w, `</tbody></table>`)
 	}

@@ -266,6 +266,34 @@ func (db *DB) Close() error {
 	return db.conn.Close()
 }
 
+// DeleteSite removes a site by ID.
+func (db *DB) DeleteSite(id int64) error {
+	_, err := db.conn.Exec(`DELETE FROM sites WHERE id = $1`, id)
+	return err
+}
+
+// RecheckAllSites resets ALL sites back to pending for re-validation.
+// Non-working sites will be deleted by the worker after checking.
+// Returns the number of sites reset.
+func (db *DB) RecheckAllSites() (int, error) {
+	res, err := db.conn.Exec(`
+		UPDATE sites SET status = 'pending', check_count = 0, error_code = '', error_msg = '', updated_at = NOW()
+		WHERE status != 'pending'
+	`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// CountWorkingUnder15 returns the number of working sites with checkout_price <= $15.
+func (db *DB) CountWorkingUnder15() (int, error) {
+	var count int
+	err := db.conn.QueryRow(`SELECT COUNT(*) FROM sites WHERE status = 'working' AND checkout_price > 0 AND checkout_price <= 15`).Scan(&count)
+	return count, err
+}
+
 func init() {
 	// Silence unused import warning — the postgres driver registers itself via init()
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)

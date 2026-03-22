@@ -10,11 +10,17 @@ import (
 )
 
 func main() {
-	// Number of Chrome processes (each handles ~10 tabs)
-	numChrome := 1
+	// Max concurrent tabs in the single Chrome browser
+	maxTabs := 30
+	if v := os.Getenv("MAX_TABS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxTabs = n
+		}
+	}
+	// Legacy env var support
 	if v := os.Getenv("CHROME_POOL_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			numChrome = n
+			maxTabs = n
 		}
 	}
 
@@ -40,15 +46,22 @@ func main() {
 		fmt.Println("DATABASE_URL not set — site management disabled (card checking still works)")
 	}
 
-	fmt.Printf("Starting with %d Chrome process(es) (on-demand)...\n", numChrome)
-	pool := NewChromePool(numChrome)
-	defer pool.Close()
-	fmt.Println("Chrome pool ready")
+	fmt.Printf("Starting browser with max %d tabs...\n", maxTabs)
+	browser := NewBrowser(maxTabs)
+	defer browser.Close()
+
+	// Worker batch size
+	batchSize := 3
+	if v := os.Getenv("WORKER_BATCH_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			batchSize = n
+		}
+	}
 
 	// Start background site check worker if DB is available
 	stopWorker := make(chan struct{})
 	if db != nil {
-		worker := NewSiteCheckWorker(db, pool, numChrome)
+		worker := NewSiteCheckWorker(db, browser, batchSize)
 		go worker.Run(stopWorker)
 		fmt.Println("Site check worker started")
 	}
@@ -60,12 +73,12 @@ func main() {
 		<-sig
 		fmt.Println("\nShutting down...")
 		close(stopWorker)
-		pool.Close()
+		browser.Close()
 		if db != nil {
 			db.Close()
 		}
 		os.Exit(0)
 	}()
 
-	StartServer(":"+port, pool, db)
+	StartServer(":"+port, browser, db)
 }

@@ -34,6 +34,12 @@ func RegisterSiteRoutes(mux *http.ServeMux, db *DB) {
 	mux.HandleFunc("/sites/dashboard", func(w http.ResponseWriter, r *http.Request) {
 		handleDashboard(w, r, db)
 	})
+	mux.HandleFunc("/sites/delete", func(w http.ResponseWriter, r *http.Request) {
+		handleDeleteSite(w, r, db)
+	})
+	mux.HandleFunc("/sites/recheck", func(w http.ResponseWriter, r *http.Request) {
+		handleRecheckAll(w, r, db)
+	})
 }
 
 func checkAuth(r *http.Request) bool {
@@ -187,6 +193,46 @@ func handleExport(w http.ResponseWriter, r *http.Request, db *DB) {
 	}
 }
 
+// POST /sites/delete — delete a site by ID
+func handleDeleteSite(w http.ResponseWriter, r *http.Request, db *DB) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID <= 0 {
+		http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		return
+	}
+	if err := db.DeleteSite(req.ID); err != nil {
+		log.Printf("Error deleting site %d: %v", req.ID, err)
+		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
+		return
+	}
+	log.Printf("[api] Deleted site ID %d", req.ID)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"ok":true}`)
+}
+
+// POST /sites/recheck — reset all sites back to pending
+func handleRecheckAll(w http.ResponseWriter, r *http.Request, db *DB) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	reset, err := db.RecheckAllSites()
+	if err != nil {
+		log.Printf("Error rechecking sites: %v", err)
+		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
+		return
+	}
+	log.Printf("[api] Recheck: reset %d sites to pending", reset)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"reset": reset})
+}
+
 // GET /sites/dashboard — HTML page showing stats and working sites
 func handleDashboard(w http.ResponseWriter, r *http.Request, db *DB) {
 	if r.Method != http.MethodGet {
@@ -209,6 +255,8 @@ func handleDashboard(w http.ResponseWriter, r *http.Request, db *DB) {
 		http.Error(w, "database error", http.StatusInternalServerError)
 		return
 	}
+
+	under15, _ := db.CountWorkingUnder15()
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, `<!DOCTYPE html>
@@ -245,6 +293,10 @@ a:hover{text-decoration:underline}
 .refresh{margin-bottom:16px;text-align:right}
 .refresh a{background:#334155;padding:8px 16px;border-radius:8px;color:#e2e8f0;font-size:.85rem}
 .refresh a:hover{background:#475569;text-decoration:none}
+.btn-recheck{background:#7c3aed!important;color:#fff!important}
+.btn-recheck:hover{background:#6d28d9!important}
+.btn-del{background:#dc2626;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:.8rem}
+.btn-del:hover{background:#b91c1c}
 h2{font-size:1.2rem;margin-bottom:12px;color:#f8fafc}
 </style>
 </head>
@@ -259,28 +311,50 @@ h2{font-size:1.2rem;margin-bottom:12px;color:#f8fafc}
 	fmt.Fprintf(w, `<div class="stat"><div class="num">%d</div><div class="label">Checking</div></div>`, stats["checking"])
 	fmt.Fprintf(w, `<div class="stat dead"><div class="num">%d</div><div class="label">Dead</div></div>`, stats["dead"])
 	fmt.Fprintf(w, `<div class="stat error"><div class="num">%d</div><div class="label">Errors</div></div>`, stats["error"])
+	fmt.Fprintf(w, `<div class="stat working"><div class="num">%d</div><div class="label">Working ≤$15</div></div>`, under15)
 
 	fmt.Fprint(w, `</div>
-<div class="refresh"><a href="/sites/dashboard">↻ Refresh</a> &nbsp; <a href="/sites/export">⬇ Export TXT</a></div>`)
+<div class="refresh">
+<a href="/sites/dashboard">↻ Refresh</a> &nbsp; <a href="/sites/export">⬇ Export TXT</a> &nbsp;
+<a href="#" onclick="recheckAll(); return false;" class="btn-recheck">🔄 Recheck All Sites</a>
+</div>`)
 
 	fmt.Fprintf(w, `<h2>Working Sites (%d)</h2>`, workingTotal)
 
 	if len(sites) == 0 {
 		fmt.Fprint(w, `<div class="empty">No working sites found yet. The checker is still processing.</div>`)
 	} else {
-		fmt.Fprint(w, `<table><thead><tr><th>#</th><th>Store URL</th><th>Price</th><th>Last Checked</th></tr></thead><tbody>`)
+		fmt.Fprint(w, `<table><thead><tr><th>#</th><th>Store URL</th><th>Price</th><th>Last Checked</th><th>Action</th></tr></thead><tbody>`)
 		for i, s := range sites {
 			lastChecked := "—"
 			if s.LastChecked != nil {
 				lastChecked = s.LastChecked.Format("Jan 02 15:04")
 			}
-			fmt.Fprintf(w, `<tr><td>%d</td><td><a href="%s" target="_blank" rel="noopener">%s</a></td><td class="price">$%.2f</td><td>%s</td></tr>`,
-				i+1, s.URL, s.URL, s.CheckoutPrice, lastChecked)
+			fmt.Fprintf(w, `<tr><td>%d</td><td><a href="%s" target="_blank" rel="noopener">%s</a></td><td class="price">$%.2f</td><td>%s</td><td><button class="btn-del" onclick="deleteSite(%d, this)">✕</button></td></tr>`,
+				i+1, s.URL, s.URL, s.CheckoutPrice, lastChecked, s.ID)
 		}
 		fmt.Fprint(w, `</tbody></table>`)
 	}
 
 	fmt.Fprint(w, `</div>
-<script>setTimeout(()=>location.reload(),30000)</script>
+<script>
+function deleteSite(id, btn) {
+	if (!confirm('Delete this site?')) return;
+	btn.disabled = true;
+	btn.textContent = '...';
+	fetch('/sites/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:id})})
+		.then(r => r.json())
+		.then(d => { if(d.ok) btn.closest('tr').remove(); else { alert('Error'); btn.disabled=false; btn.textContent='✕'; } })
+		.catch(() => { alert('Error'); btn.disabled=false; btn.textContent='✕'; });
+}
+function recheckAll() {
+	if (!confirm('Reset ALL sites back to pending for re-checking?')) return;
+	fetch('/sites/recheck', {method:'POST'})
+		.then(r => r.json())
+		.then(d => { alert('Deleted ' + d.deleted + ' dead/error sites, reset ' + d.reset + ' to pending'); location.reload(); })
+		.catch(() => alert('Error'));
+}
+setTimeout(()=>location.reload(),30000);
+</script>
 </body></html>`)
 }

@@ -3,25 +3,37 @@ package main
 import (
 	"fmt"
 	"log"
-	"strings"
+	"sync"
 	"time"
+
+	"github.com/go-rod/rod/lib/proto"
 )
 
-// SiteCheckWorker continuously pulls pending sites from the DB,
-// checks them using the Chrome pool, and writes results back.
+// SiteCheckWorker continuously pulls pending sites from the DB and runs
+// a full checkout with a test card. If the site returns INCORRECT_NUMBER,
+// the checkout flow works → site is marked working.
 type SiteCheckWorker struct {
 	db        *DB
-	pool      *ChromePool
+	browser   *Browser
 	batchSize int
 }
 
-// NewSiteCheckWorker creates a background worker that checks sites.
-// batchSize controls how many sites to check per tick (should match pool size).
-func NewSiteCheckWorker(db *DB, pool *ChromePool, batchSize int) *SiteCheckWorker {
+// Test card used for site validation — triggers INCORRECT_NUMBER if checkout works.
+var workerTestCard = CardInfo{
+	Raw:    "5524860214037312|10|28|950",
+	Number: "5524 8602 1403 7312",
+	ExpMM:  "10",
+	ExpYY:  "28",
+	CVV:    "950",
+	Last4:  "7312",
+}
+
+// NewSiteCheckWorker creates a background worker.
+func NewSiteCheckWorker(db *DB, browser *Browser, batchSize int) *SiteCheckWorker {
 	if batchSize <= 0 {
 		batchSize = 3
 	}
-	return &SiteCheckWorker{db: db, pool: pool, batchSize: batchSize}
+	return &SiteCheckWorker{db: db, browser: browser, batchSize: batchSize}
 }
 
 // Run starts the worker loop. Call in a goroutine.
@@ -64,109 +76,69 @@ func (w *SiteCheckWorker) processBatch() {
 
 	log.Printf("[worker] Checking %d sites...", len(sites))
 
-	// Use a test card that will always fail with INCORRECT_NUMBER on working sites.
-	// This is the whole point — INCORRECT_NUMBER means the site's checkout is alive.
-	testCard := "4111111111111111|12|28|123"
-
-	buyer := DefaultBuyer()
-
-	// Build card entries — one per site
-	entries := make([]CardEntry, len(sites))
-	for i, site := range sites {
-		raw := fmt.Sprintf("%s|%s", testCard, site.URL)
-		entry, err := ParseCardEntry(raw, i)
-		if err != nil {
-			log.Printf("[worker] Error parsing entry for %s: %v", site.URL, err)
-			w.db.UpdateSiteResult(site.ID, StatusError, "PARSE_ERROR", err.Error(), 0)
-			continue
-		}
-		entry.Card.FullName = buyer.FirstName + " " + buyer.LastName
-		entries[i] = entry
+	var wg sync.WaitGroup
+	for _, site := range sites {
+		wg.Add(1)
+		go func(s Site) {
+			defer wg.Done()
+			w.checkSite(s)
+		}(site)
 	}
-
-	// Run batch through the Chrome pool
-	results, err := w.pool.RunBatch(entries, buyer, perStoreDefaultLimit)
-	if err != nil {
-		log.Printf("[worker] Batch error: %v", err)
-		// Put sites back to pending
-		for _, site := range sites {
-			w.db.UpdateSiteResult(site.ID, StatusError, "BATCH_ERROR", err.Error(), 0)
-		}
-		return
-	}
-
-	// Check if the entire batch was a Chrome infrastructure failure
-	// (e.g. "Cannot fork", "resource temporarily unavailable")
-	infraFailCount := 0
-	for _, r := range results {
-		if isInfraError(r.ErrorMessage) {
-			infraFailCount++
-		}
-	}
-
-	if infraFailCount == len(results) {
-		// ALL checks failed due to Chrome infra — revert ALL sites to pending
-		// without incrementing check_count, then back off
-		log.Printf("[worker] ⛔ Chrome cannot start — reverting %d sites to pending, backing off 30s", len(sites))
-		for _, site := range sites {
-			w.db.RevertToPending(site.ID)
-		}
-		time.Sleep(30 * time.Second)
-		return
-	}
-
-	// Process results
-	for i, r := range results {
-		site := sites[i]
-
-		// If this specific result is a Chrome infra error, revert without penalty
-		if isInfraError(r.ErrorMessage) {
-			log.Printf("[worker] ⚠️ CHROME ERROR (no penalty): %s", site.URL)
-			w.db.RevertToPending(site.ID)
-			continue
-		}
-
-		switch {
-		case r.ErrorCode == "INCORRECT_NUMBER" || r.ErrorCode == "INVALID_PAYMENT_METHOD":
-			// WORKING — the checkout is live, it tried to process the card
-			log.Printf("[worker] ✅ WORKING: %s ($%.2f) (%s)", site.URL, r.CheckoutPrice, r.ErrorCode)
-			w.db.UpdateSiteResult(site.ID, StatusWorking, r.ErrorCode, r.ErrorMessage, r.CheckoutPrice)
-
-		case r.ErrorCode == "CHECKOUT_FAILED" || r.ErrorCode == "PAYMENT_FILL_FAILED":
-			// Site is dead or broken
-			log.Printf("[worker] ❌ DEAD: %s (%s)", site.URL, r.ErrorCode)
-			w.db.UpdateSiteResult(site.ID, StatusDead, r.ErrorCode, r.ErrorMessage, r.CheckoutPrice)
-
-		case r.Status == "error" && site.CheckCount < 2:
-			// Transient error — retry later
-			log.Printf("[worker] ⚠️ ERROR (will retry): %s (%s)", site.URL, r.ErrorCode)
-			w.db.UpdateSiteResult(site.ID, StatusError, r.ErrorCode, r.ErrorMessage, r.CheckoutPrice)
-
-		case r.Status == "declined":
-			// Any other decline — checkout works but different error
-			// Still means the site is alive enough to reach payment
-			log.Printf("[worker] ✅ WORKING (declined): %s ($%.2f) (%s)", site.URL, r.CheckoutPrice, r.ErrorCode)
-			w.db.UpdateSiteResult(site.ID, StatusWorking, r.ErrorCode, r.ErrorMessage, r.CheckoutPrice)
-
-		default:
-			// Any other outcome — mark dead after retries exhausted
-			if site.CheckCount >= 2 {
-				log.Printf("[worker] ❌ DEAD (max retries): %s (%s)", site.URL, r.ErrorCode)
-				w.db.UpdateSiteResult(site.ID, StatusDead, r.ErrorCode, r.ErrorMessage, r.CheckoutPrice)
-			} else {
-				log.Printf("[worker] ⚠️ UNKNOWN (retrying): %s (%s: %s)", site.URL, r.ErrorCode, r.ErrorMessage)
-				w.db.UpdateSiteResult(site.ID, StatusError, r.ErrorCode, r.ErrorMessage, r.CheckoutPrice)
-			}
-		}
-	}
+	wg.Wait()
 }
 
-// isInfraError returns true if the error is a Chrome/OS infrastructure failure,
-// not a site-specific problem.
-func isInfraError(errMsg string) bool {
-	lower := strings.ToLower(errMsg)
-	return strings.Contains(lower, "failed to init tab") ||
-		strings.Contains(lower, "cannot fork") ||
-		strings.Contains(lower, "resource temporarily unavailable") ||
-		strings.Contains(lower, "chrome failed to start")
+// checkSite runs a full checkout with a test card via the browser.
+// INCORRECT_NUMBER means the checkout flow works end-to-end → site is working.
+func (w *SiteCheckWorker) checkSite(site Site) {
+	storeURL := site.URL
+	buyer := DefaultBuyer()
+
+	entry := CardEntry{
+		Card:  workerTestCard,
+		Store: storeURL,
+		Index: 0,
+	}
+	entry.Card.FullName = buyer.FirstName + " " + buyer.LastName
+
+	// Acquire a tab slot
+	w.browser.tabSem <- struct{}{}
+	defer func() { <-w.browser.tabSem }()
+
+	// Recover from panics
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[worker] PANIC checking %s: %v", storeURL, r)
+			w.db.UpdateSiteResult(site.ID, StatusError, "PANIC", fmt.Sprintf("%v", r), 0)
+		}
+	}()
+
+	// Open a new tab
+	page, err := w.browser.browser.Page(proto.TargetCreateTarget{URL: ""})
+	if err != nil {
+		log.Printf("[worker] Tab create failed for %s: %v", storeURL, err)
+		w.db.UpdateSiteResult(site.ID, StatusError, "TAB_CREATE_FAILED", err.Error(), 0)
+		return
+	}
+	defer page.Close()
+	page = page.Timeout(180 * time.Second)
+
+	// Run the full checkout
+	result := runCheckout(page, entry, buyer)
+	log.Printf("[worker] %s → %s (%s) in %.1fs", storeURL, result.Status, result.ErrorCode, result.ElapsedSeconds)
+
+	// INCORRECT_NUMBER or CARD_DECLINED = checkout flow works, site is valid
+	if result.ErrorCode == "INCORRECT_NUMBER" || result.ErrorCode == "CARD_DECLINED" {
+		price := result.CheckoutPrice
+		log.Printf("[worker] WORKING: %s ($%.2f)", storeURL, price)
+		w.db.UpdateSiteResult(site.ID, StatusWorking, "CHECKOUT_VERIFIED", fmt.Sprintf("full checkout works ($%.2f)", price), price)
+		return
+	}
+
+	// Site is not working — delete it
+	errMsg := result.ErrorCode
+	if result.ErrorMessage != "" {
+		errMsg = result.ErrorMessage
+	}
+	log.Printf("[worker] REMOVING: %s (%s)", storeURL, errMsg)
+	w.db.DeleteSite(site.ID)
 }

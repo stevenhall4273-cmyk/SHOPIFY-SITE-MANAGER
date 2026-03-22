@@ -41,7 +41,7 @@ type CheckResult struct {
 	ErrorCode      string  `json:"error_code"`
 	ErrorMessage   string  `json:"error_message"`
 	OrderNumber    string  `json:"order_number,omitempty"`
-	CheckoutPrice  float64 `json:"checkout_price"` // price of cheapest product used
+	CheckoutPrice  float64 `json:"checkout_price"`
 	ElapsedSeconds float64 `json:"elapsed_seconds"`
 }
 
@@ -84,17 +84,21 @@ func DefaultBuyer() BuyerInfo {
 	}
 }
 
-// ParseCardEntry parses "number|MM|YY|CVV|storeURL" into a CardEntry.
+// ParseCardEntry parses "number|MM|YY|CVV" or "number|MM|YY|CVV|storeURL" into a CardEntry.
+// If storeURL is omitted, Store will be empty and must be assigned by the caller.
 func ParseCardEntry(raw string, index int) (CardEntry, error) {
 	parts := splitCardParts(raw)
-	if len(parts) < 5 {
-		return CardEntry{}, fmt.Errorf("invalid format: expected number|MM|YY|CVV|storeURL, got %d parts", len(parts))
+	if len(parts) < 4 {
+		return CardEntry{}, fmt.Errorf("invalid format: expected number|MM|YY|CVV[|storeURL], got %d parts", len(parts))
 	}
 	num := strings.TrimSpace(parts[0])
 	mm := strings.TrimSpace(parts[1])
 	yy := strings.TrimSpace(parts[2])
 	cvv := strings.TrimSpace(parts[3])
-	store := strings.TrimSpace(strings.Join(parts[4:], "|")) // store URL may not contain | but be safe
+	store := ""
+	if len(parts) >= 5 {
+		store = strings.TrimSpace(strings.Join(parts[4:], "|"))
+	}
 
 	// Format card number with spaces
 	var spaced []string

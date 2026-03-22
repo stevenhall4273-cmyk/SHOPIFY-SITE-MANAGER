@@ -41,7 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# chromedp auto-detects Chromium at this path
+# Rod launcher detects Chromium at this path
 ENV CHROME_PATH=/usr/bin/chromium
 
 # Create non-root user
@@ -52,4 +52,4 @@ COPY --from=builder /checker /usr/local/bin/checker
 
 EXPOSE 8080
 
-CMD ["checker"]
+CMD ["sh", "-c", "ulimit -u 65535 2>/dev/null; ulimit -n 65535 2>/dev/null; exec checker"]

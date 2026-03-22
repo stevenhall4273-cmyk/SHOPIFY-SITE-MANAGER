@@ -1,7 +1,7 @@
 package main
 
 import (
-	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,66 +11,101 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/chromedp/cdproto/cdp"
-	"github.com/chromedp/cdproto/input"
-	"github.com/chromedp/cdproto/network"
-	"github.com/chromedp/cdproto/page"
-	"github.com/chromedp/cdproto/runtime"
-	"github.com/chromedp/cdproto/target"
-	"github.com/chromedp/chromedp"
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/input"
+	"github.com/go-rod/rod/lib/proto"
 )
 
-// runCheckout executes a full checkout flow for one card+store in the given browser tab context.
-// ctx must be a chromedp context (a browser tab). Returns the result.
-func runCheckout(ctx context.Context, entry CardEntry, buyer BuyerInfo) CheckResult {
+// safeEval evaluates JS on the page, returning the string result or "" on error.
+func safeEval(pg *rod.Page, js string) string {
+	res, err := pg.Eval(js)
+	if err != nil {
+		return ""
+	}
+	return res.Value.String()
+}
+
+// paymentCapture stores a captured PollForReceipt/SubmitForCompletion response.
+type paymentCapture struct {
+	URL    string
+	Status int
+	Body   string
+}
+
+// runCheckout executes a full checkout flow for one card+store in the given Rod page.
+func runCheckout(pg *rod.Page, entry CardEntry, buyer BuyerInfo) (result CheckResult) {
 	start := time.Now()
+	defer func() { result.ElapsedSeconds = time.Since(start).Seconds() }()
 	card := entry.Card
 	card.FullName = buyer.FirstName + " " + buyer.LastName
 	storeURL := entry.Store
 
-	result := CheckResult{
+	result = CheckResult{
 		Index:     entry.Index,
 		CardLast4: card.Last4,
 		Store:     storeURL,
 		Status:    "error",
 	}
-	defer func() {
-		result.ElapsedSeconds = time.Since(start).Seconds()
-	}()
 
 	logPrefix := fmt.Sprintf("[%d/%s]", entry.Index, card.Last4)
 
 	// Remove navigator.webdriver flag
-	chromedp.ListenTarget(ctx, func(ev interface{}) {
-		if _, ok := ev.(*target.EventTargetCreated); ok {
-			go func() {
-				_ = chromedp.Run(ctx,
-					chromedp.Evaluate(`Object.defineProperty(navigator, 'webdriver', {get: () => undefined})`, nil),
-				)
-			}()
-		}
-	})
+	pg.EvalOnNewDocument(`Object.defineProperty(navigator, 'webdriver', {get: () => undefined})`)
 
-	// Navigate to about:blank to initialize the tab
-	if err := chromedp.Run(ctx, chromedp.Navigate("about:blank")); err != nil {
-		result.ErrorMessage = "failed to init tab: " + err.Error()
-		fmt.Printf("%s ERROR: %s\n", logPrefix, result.ErrorMessage)
-		return result
-	}
+	// Enable CDP Fetch domain to intercept PollForReceipt/SubmitForCompletion responses.
+	proto.FetchEnable{
+		Patterns: []*proto.FetchRequestPattern{
+			{URLPattern: "*PollForReceipt*", RequestStage: proto.FetchRequestStageRequest},
+			{URLPattern: "*SubmitForCompletion*", RequestStage: proto.FetchRequestStageRequest},
+			{URLPattern: "*PollForReceipt*", RequestStage: proto.FetchRequestStageResponse},
+			{URLPattern: "*SubmitForCompletion*", RequestStage: proto.FetchRequestStageResponse},
+		},
+	}.Call(pg)
+	var netCapMu sync.Mutex
+	var netCaptures []paymentCapture
+	go pg.EachEvent(func(e *proto.FetchRequestPaused) {
+		reqURL := e.Request.URL
+		if e.ResponseStatusCode == nil {
+			fmt.Printf("%s CDP Fetch request: %s\n", logPrefix, reqURL[:min(len(reqURL), 120)])
+			proto.FetchContinueRequest{RequestID: e.RequestID}.Call(pg)
+			return
+		}
+		status := *e.ResponseStatusCode
+		bodyRes, err := proto.FetchGetResponseBody{RequestID: e.RequestID}.Call(pg)
+		if err == nil && bodyRes != nil {
+			body := bodyRes.Body
+			if bodyRes.Base64Encoded {
+				if decoded, err := base64.StdEncoding.DecodeString(body); err == nil {
+					body = string(decoded)
+				}
+			}
+			netCapMu.Lock()
+			netCaptures = append(netCaptures, paymentCapture{
+				URL:    reqURL,
+				Status: status,
+				Body:   body,
+			})
+			netCapMu.Unlock()
+			fmt.Printf("%s CDP Fetch response: %s (status=%d, %d bytes)\n",
+				logPrefix, reqURL[:min(len(reqURL), 120)], status, len(body))
+		}
+		proto.FetchContinueResponse{RequestID: e.RequestID}.Call(pg)
+	})()
 
 	// ── Create checkout via HTTP ──
 	fmt.Printf("%s Creating checkout on %s...\n", logPrefix, storeURL)
-	checkoutURL, cookies, variantID, checkoutPrice, err := createCheckout(storeURL)
+	checkoutURL, cookies, variantID, productPrice, err := createCheckout(storeURL)
 	if err != nil {
 		result.ErrorMessage = "checkout creation failed: " + err.Error()
 		result.ErrorCode = "CHECKOUT_FAILED"
 		fmt.Printf("%s ERROR: %s\n", logPrefix, result.ErrorMessage)
 		return result
 	}
-	result.CheckoutPrice = checkoutPrice
-	fmt.Printf("%s Checkout URL ready (%.1fs) — $%.2f\n", logPrefix, time.Since(start).Seconds(), checkoutPrice)
+	result.CheckoutPrice = productPrice
+	fmt.Printf("%s Checkout URL ready (%.1fs)\n", logPrefix, time.Since(start).Seconds())
 
 	// ── Inject cookies and navigate to checkout ──
 	parsedStore, _ := url.Parse(storeURL)
@@ -81,96 +116,107 @@ func runCheckout(ctx context.Context, entry CardEntry, buyer BuyerInfo) CheckRes
 	}
 	cookieDomain = "." + cookieDomain
 
+	var rodCookies []*proto.NetworkCookieParam
 	for _, c := range cookies {
-		expr := network.SetCookie(c.Name, c.Value).WithDomain(cookieDomain).WithPath("/")
-		chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-			return expr.Do(ctx)
-		}))
+		rodCookies = append(rodCookies, &proto.NetworkCookieParam{
+			Name:   c.Name,
+			Value:  c.Value,
+			Domain: cookieDomain,
+			Path:   "/",
+		})
 	}
+	pg.SetCookies(rodCookies)
 
-	if err := chromedp.Run(ctx, chromedp.Navigate(checkoutURL)); err != nil {
+	// Navigate and wait for page to settle (resilient to redirects)
+	err = pg.Navigate(checkoutURL)
+	if err != nil {
 		result.ErrorMessage = "failed to navigate to checkout: " + err.Error()
 		fmt.Printf("%s ERROR: %s\n", logPrefix, result.ErrorMessage)
 		return result
 	}
+	time.Sleep(2 * time.Second)
 
-	// Wait for checkout form
-	checkoutReady := false
-	waitCtx, waitCancel := context.WithTimeout(ctx, 3*time.Second)
-	if err := chromedp.Run(waitCtx,
-		chromedp.WaitVisible(`input#email, input[autocomplete="email"], input[name="email"]`, chromedp.ByQuery),
-	); err == nil {
-		checkoutReady = true
+	// Wait for checkout form with generous timeout
+	emailEl, err := pg.Timeout(15 * time.Second).Element(`input#email, input[autocomplete="email"], input[name="email"]`)
+	checkoutReady := err == nil && emailEl != nil
+
+	info, _ := pg.Info()
+	currentURL := ""
+	if info != nil {
+		currentURL = info.URL
 	}
-	waitCancel()
-
-	var currentURL string
-	chromedp.Run(ctx, chromedp.Location(&currentURL))
 
 	if !checkoutReady || (!strings.Contains(currentURL, "/checkouts/") && !strings.Contains(currentURL, "/checkout")) {
-		fmt.Printf("%s Redirected to homepage — recreating cart in browser\n", logPrefix)
-		addURL := fmt.Sprintf("%s/cart/add?id=%d&quantity=1", storeURL, variantID)
-		if err := chromedp.Run(ctx,
-			chromedp.Navigate(addURL),
-			chromedp.Sleep(500*time.Millisecond),
-		); err != nil {
-			result.ErrorMessage = "failed to add to cart in browser"
-			fmt.Printf("%s ERROR: %s\n", logPrefix, result.ErrorMessage)
-			return result
+		fmt.Printf("%s Redirected — recreating cart in browser\n", logPrefix)
+
+		// Use cart/add.js via fetch in the page
+		addJS := fmt.Sprintf(`() => {
+			return fetch('%s/cart/add.js', {
+				method:'POST',
+				headers:{'Content-Type':'application/json'},
+				body: JSON.stringify({items:[{id:%d,quantity:1}]})
+			}).then(r => r.ok ? 'ok' : 'status:'+r.status).catch(e => 'error:'+e.message)
+		}`, storeURL, variantID)
+
+		addRes, evalErr := pg.Eval(addJS)
+		addResult := ""
+		if evalErr == nil && addRes != nil {
+			addResult = addRes.Value.String()
 		}
-		if err := chromedp.Run(ctx, chromedp.Navigate(storeURL+"/checkout")); err != nil {
+		if !strings.Contains(addResult, "ok") {
+			// Fallback: navigate to cart/add URL
+			addURL := fmt.Sprintf("%s/cart/add?id=%d&quantity=1", storeURL, variantID)
+			pg.Navigate(addURL)
+			time.Sleep(2 * time.Second)
+		}
+
+		err = pg.Navigate(storeURL + "/checkout")
+		if err != nil {
 			result.ErrorMessage = "failed to navigate to checkout (retry)"
+			result.ErrorCode = "CHECKOUT_FAILED"
 			fmt.Printf("%s ERROR: %s\n", logPrefix, result.ErrorMessage)
 			return result
 		}
-		retryWait, retryCancel := context.WithTimeout(ctx, 5*time.Second)
-		if err := chromedp.Run(retryWait,
-			chromedp.WaitVisible(`input#email, input[autocomplete="email"], input[name="email"]`, chromedp.ByQuery),
-		); err != nil {
-			retryCancel()
+		time.Sleep(2 * time.Second)
+
+		_, err := pg.Timeout(10 * time.Second).Element(`input#email, input[autocomplete="email"], input[name="email"]`)
+		if err != nil {
 			result.ErrorMessage = "checkout form not found on retry"
+			result.ErrorCode = "CHECKOUT_FAILED"
 			fmt.Printf("%s ERROR: %s\n", logPrefix, result.ErrorMessage)
 			return result
 		}
-		retryCancel()
 	}
 
 	// ── Fill checkout form ──
 	fmt.Printf("%s Filling checkout form...\n", logPrefix)
 	fillJS := buildFillJS(buyer)
-	var fillResult string
-	if err := chromedp.Run(ctx, chromedp.Evaluate(fillJS, &fillResult)); err != nil {
-		result.ErrorMessage = "failed to fill form: " + err.Error()
-		fmt.Printf("%s ERROR: %s\n", logPrefix, result.ErrorMessage)
-		return result
-	}
+	fillResult := safeEval(pg, fmt.Sprintf("() => { return %s }", fillJS))
 	fmt.Printf("%s Form: %s\n", logPrefix, fillResult)
 
 	// Dismiss autocomplete
-	chromedp.Run(ctx, chromedp.KeyEvent("\x1b"))
-	chromedp.Run(ctx, chromedp.Evaluate(`document.body.click()`, nil))
+	pg.Keyboard.Press(input.Escape)
+	pg.Eval(`() => document.body.click()`)
 	time.Sleep(100 * time.Millisecond)
 
 	// Fix country if needed
 	countryFixJS := buildCountryFixJS(buyer.Country)
-	var countryStatus string
-	chromedp.Run(ctx, chromedp.Evaluate(countryFixJS, &countryStatus))
+	countryStatus := safeEval(pg, fmt.Sprintf("() => { return %s }", countryFixJS))
 	if strings.Contains(countryStatus, "not found") || strings.Contains(countryStatus, "not set") {
-		selectDropdownViaClick(ctx, buyer.Country, buyer.CountryName)
+		selectDropdownViaEval(pg, buyer.Country, buyer.CountryName)
 	}
 
 	time.Sleep(150 * time.Millisecond)
 
 	// Fix state if needed
 	stateFixJS := buildStateFixJS(buyer.State)
-	var stateStatus string
-	chromedp.Run(ctx, chromedp.Evaluate(stateFixJS, &stateStatus))
+	stateStatus := safeEval(pg, fmt.Sprintf("() => { return %s }", stateFixJS))
 	if strings.Contains(stateStatus, "not set") {
-		selectDropdownViaClick(ctx, buyer.State, buyer.StateName)
+		selectDropdownViaEval(pg, buyer.State, buyer.StateName)
 	}
 
 	// Auto-fill empty address2
-	chromedp.Run(ctx, chromedp.Evaluate(`(()=>{
+	pg.Eval(`() => {
 		function setNativeValue(el, val) {
 			const s = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
 			s.call(el, val);
@@ -184,48 +230,132 @@ func runCheckout(ctx context.Context, entry CardEntry, buyer BuyerInfo) CheckRes
 			if(el && !el.value){ el.focus(); setNativeValue(el, 'Apt'); return 'filled'; }
 		}
 		return 'none';
-	})()`, nil))
+	}`)
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(1500 * time.Millisecond) // let Shopify recalculate payment methods after country change
 
-	// ── Handle shipping / multi-step ──
+	// ── Multi-step checkout advancement ──
+	// Some Shopify stores use multi-step checkout (Info → Shipping → Payment).
 	for step := 0; step < 3; step++ {
-		if !clickContinueIfPresent(ctx) {
+		advanced := safeEval(pg, `() => {
+			const btns = document.querySelectorAll('button[type="submit"], button, input[type="submit"]');
+			const kw = ['continue to shipping','continue to payment','continue','next step','proceed'];
+			const stop = ['pay now','complete order','place order','submit order','buy now','add tip','apply','remove','shop pay','paypal'];
+			for(const b of btns){
+				const txt = b.textContent.toLowerCase().trim().replace(/\s+/g,' ');
+				if(txt.length > 60 || txt.length < 3) continue;
+				if(stop.some(s => txt.includes(s))) continue;
+				if(kw.some(k => txt.includes(k)) && b.offsetParent !== null){
+					b.click();
+					return 'clicked: '+txt;
+				}
+			}
+			return 'none';
+		}`)
+		if advanced == "none" || advanced == "" {
 			break
 		}
+		fmt.Printf("%s Multi-step: %s\n", logPrefix, advanced)
+		time.Sleep(2000 * time.Millisecond)
+		fixValidationErrors(pg, buyer.Phone)
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	fixValidationErrors(ctx, buyer.Phone)
-	time.Sleep(300 * time.Millisecond)
+	// ── Early detection of shipping/store errors ──
+	earlyError := safeEval(pg, `() => {
+		const body = (document.body ? document.body.innerText : '').toLowerCase();
+		const issues = ['not available for delivery','shipping not available','cannot be shipped',
+			'checkout is unavailable','empty cart and return','cart is empty'];
+		for(const kw of issues){
+			if(body.includes(kw)){
+				const sels = ['[role="alert"]','.notice--error','.banner--error','.banner__content',
+					'[class*="error-message"]','[class*="notice"]','[class*="error"]'];
+				for(const sel of sels){
+					for(const el of document.querySelectorAll(sel)){
+						const t = el.textContent.trim();
+						if(t && t.length > 10 && t.length < 500) return t;
+					}
+				}
+				return body.substring(0, 300);
+			}
+		}
+		return '';
+	}`)
+	if earlyError != "" {
+		result.ErrorCode = "CHECKOUT_FAILED"
+		result.ErrorMessage = earlyError
+		fmt.Printf("%s EARLY CHECKOUT ERROR: %s\n", logPrefix, earlyError)
+		return result
+	}
+
+	// Try to select "Credit card" payment method if not already selected
+	ccSel := safeEval(pg, `() => {
+		const kw = ['credit card','credit','debit or credit','card'];
+		const stop = ['gift card','card on file','saved card'];
+		function match(txt){ txt=txt.toLowerCase().trim(); return kw.some(k=>txt.includes(k)) && !stop.some(s=>txt.includes(s)); }
+		const radios = document.querySelectorAll('input[type="radio"]');
+		for(const r of radios){
+			const lbl = r.closest('label') || document.querySelector('label[for="'+r.id+'"]');
+			if(lbl && match(lbl.textContent)){ r.click(); lbl.click(); return 'radio:'+lbl.textContent.trim().substring(0,40); }
+		}
+		const els = document.querySelectorAll('[role="radio"],[role="tab"],[data-payment-method],button[class*="payment"],[class*="payment-method"] [role="button"]');
+		for(const e of els){
+			if(match(e.textContent)){ e.click(); return 'el:'+e.textContent.trim().substring(0,40); }
+		}
+		return 'none';
+	}`)
+	if ccSel != "none" && ccSel != "" {
+		fmt.Printf("%s Credit card selected: %s\n", logPrefix, ccSel)
+		time.Sleep(1500 * time.Millisecond)
+	}
+
+	// Debug: dump page state before payment fill
+	debugInfo := safeEval(pg, `() => {
+		const r = {url: location.href, buttons: [], iframes: [], sections: []};
+		document.querySelectorAll('button, input[type="submit"], a[role="button"]').forEach(b => {
+			const txt = b.textContent.trim().replace(/\s+/g, ' ').substring(0, 60);
+			if(txt.length > 2) r.buttons.push(txt);
+		});
+		document.querySelectorAll('iframe').forEach(f => {
+			r.iframes.push((f.id||'no-id') + ' :: ' + (f.src||'').substring(0, 80));
+		});
+		document.querySelectorAll('[data-step], [class*="payment"], [class*="shipping"], section, [role="main"]').forEach(s => {
+			const cls = s.className ? (typeof s.className === 'string' ? s.className : '') : '';
+			r.sections.push(s.tagName + '.' + cls.substring(0, 60));
+		});
+		return JSON.stringify(r);
+	}`)
+	fmt.Printf("%s PAGE STATE: %s\n", logPrefix, debugInfo)
 
 	// ── Fill payment ──
-	fmt.Printf("%s Filling payment...\n", logPrefix)
-	if err := fillPaymentIframe(ctx, card); err != nil {
-		result.ErrorMessage = "payment fill failed: " + err.Error()
+	fmt.Printf("%s Filling payment... (%.1fs)\n", logPrefix, time.Since(start).Seconds())
+	payDone := make(chan error, 1)
+	go func() { payDone <- fillPaymentIframe(pg, card, logPrefix) }()
+	var payErr error
+	select {
+	case payErr = <-payDone:
+	case <-time.After(45 * time.Second):
+		payErr = fmt.Errorf("payment fill timed out after 45s")
+	}
+	if payErr != nil {
+		result.ErrorMessage = "payment fill failed: " + payErr.Error()
 		result.ErrorCode = "PAYMENT_FILL_FAILED"
 		fmt.Printf("%s ERROR: %s\n", logPrefix, result.ErrorMessage)
 		return result
 	}
+	fmt.Printf("%s Payment filled (%.1fs)\n", logPrefix, time.Since(start).Seconds())
 
 	// Fill billing address if separate
 	billingJS := buildBillingJS(buyer)
-	chromedp.Run(ctx, chromedp.Evaluate(billingJS, nil))
-
-	// Inject interceptor (no-op, uses Performance API)
-	injectFetchInterceptor(ctx)
+	pg.Eval(fmt.Sprintf("() => { return %s }", billingJS))
 
 	// ── Click Pay ──
-	fmt.Printf("%s Clicking Pay...\n", logPrefix)
-	if err := clickPayButton(ctx); err != nil {
-		result.ErrorMessage = "failed to click pay: " + err.Error()
-		fmt.Printf("%s ERROR: %s\n", logPrefix, result.ErrorMessage)
-		return result
-	}
+	fmt.Printf("%s Clicking Pay... (%.1fs)\n", logPrefix, time.Since(start).Seconds())
+	clickPayButton(pg)
 
 	// Quick card validation check
 	time.Sleep(500 * time.Millisecond)
-	if cardErr := checkCardValidationError(ctx); cardErr != "" {
+	if cardErr := checkCardValidationError(pg); cardErr != "" {
 		result.Status = "declined"
 		result.ErrorCode = "INCORRECT_NUMBER"
 		result.ErrorMessage = cardErr
@@ -235,12 +365,13 @@ func runCheckout(ctx context.Context, entry CardEntry, buyer BuyerInfo) CheckRes
 
 	// ── Wait for result ──
 	fmt.Printf("%s Waiting for result...\n", logPrefix)
-	waitResult := waitForCheckoutResult(ctx, logPrefix)
+	waitResult := waitForCheckoutResult(pg, logPrefix, &netCapMu, &netCaptures)
 	result.Status = waitResult.Status
 	result.ErrorCode = waitResult.ErrorCode
 	result.ErrorMessage = waitResult.ErrorMessage
 	result.OrderNumber = waitResult.OrderNumber
-	fmt.Printf("%s RESULT: %s (%s)\n", logPrefix, result.Status, result.ErrorCode)
+	result.ElapsedSeconds = time.Since(start).Seconds()
+	fmt.Printf("%s RESULT: %s (%s) in %.1fs\n", logPrefix, result.Status, result.ErrorCode, result.ElapsedSeconds)
 	return result
 }
 
@@ -271,7 +402,6 @@ func createCheckout(storeURL string) (checkoutURL string, cookies []*http.Cookie
 		},
 	}
 
-	// Fetch products
 	resp, err := client.Get(storeURL + "/products.json")
 	if err != nil {
 		return "", nil, 0, 0, fmt.Errorf("fetch products: %w", err)
@@ -279,12 +409,18 @@ func createCheckout(storeURL string) (checkoutURL string, cookies []*http.Cookie
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 
+	if resp.StatusCode != 200 {
+		return "", nil, 0, 0, fmt.Errorf("products endpoint returned %d", resp.StatusCode)
+	}
+	if len(body) > 0 && body[0] == '<' {
+		return "", nil, 0, 0, fmt.Errorf("site returned HTML instead of JSON (password-protected or unavailable)")
+	}
+
 	var data productsResponse
 	if err := json.Unmarshal(body, &data); err != nil {
 		return "", nil, 0, 0, fmt.Errorf("parse products: %w", err)
 	}
 
-	// Find cheapest variant
 	var cheapest int64
 	cheapestPrice := math.MaxFloat64
 	for _, p := range data.Products {
@@ -300,7 +436,6 @@ func createCheckout(storeURL string) (checkoutURL string, cookies []*http.Cookie
 		return "", nil, 0, 0, fmt.Errorf("no products found")
 	}
 
-	// Add to cart
 	cartBody := fmt.Sprintf(`{"items":[{"id":%d,"quantity":1}]}`, cheapest)
 	req, _ := http.NewRequest("POST", storeURL+"/cart/add.js", strings.NewReader(cartBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -310,7 +445,6 @@ func createCheckout(storeURL string) (checkoutURL string, cookies []*http.Cookie
 	}
 	resp.Body.Close()
 
-	// Create checkout
 	client.CheckRedirect = nil
 	resp, err = client.Get(storeURL + "/checkout")
 	if err != nil {
@@ -323,7 +457,7 @@ func createCheckout(storeURL string) (checkoutURL string, cookies []*http.Cookie
 }
 
 // ──────────────────────────────────────────────────────────────────
-// JS builders (parameterized with buyer/card info)
+// JS builders (same JS, unchanged)
 // ──────────────────────────────────────────────────────────────────
 
 func buildFillJS(b BuyerInfo) string {
@@ -523,35 +657,11 @@ func buildBillingJS(b BuyerInfo) string {
 }
 
 // ──────────────────────────────────────────────────────────────────
-// Helper functions (refactored from main_browser.go)
+// Helpers rewritten for Rod
 // ──────────────────────────────────────────────────────────────────
 
-func clickContinueIfPresent(ctx context.Context) bool {
-	js := `(()=>{
-		const btns = document.querySelectorAll('button[type="submit"], button, a.step__footer__continue-btn');
-		const patterns = ['continue', 'ship to', 'next step', 'proceed', 'continue to shipping', 'continue to payment'];
-		const stopWords = ['pay now', 'complete order', 'place order', 'submit order', 'buy now', 'confirm',
-			'additional', 'more', 'expand', 'show', 'toggle', 'select', 'add', 'apply', 'remove', 'change'];
-		for(const b of btns){
-			const txt = b.textContent.toLowerCase().trim().replace(/\s+/g, ' ');
-			if(txt.length > 60) continue;
-			if(stopWords.some(sw => txt.includes(sw))) continue;
-			if(patterns.some(kw => txt.includes(kw))){
-				b.click();
-				return 'clicked: '+txt;
-			}
-		}
-		return 'none';
-	})()`
-	var result string
-	if err := chromedp.Run(ctx, chromedp.Evaluate(js, &result)); err == nil && result != "none" {
-		return true
-	}
-	return false
-}
-
-func selectDropdownViaClick(ctx context.Context, value string, displayName string) {
-	clickJS := fmt.Sprintf(`(()=>{
+func selectDropdownViaEval(pg *rod.Page, value string, displayName string) {
+	js := fmt.Sprintf(`() => {
 		const sels = document.querySelectorAll('select');
 		for(const sel of sels){
 			if(sel.offsetParent === null) continue;
@@ -568,57 +678,41 @@ func selectDropdownViaClick(ctx context.Context, value string, displayName strin
 				}
 				if(!opt) continue;
 				sel.focus();
-				sel.size = 5;
 				opt.selected = true;
-				sel.size = 1;
 				sel.dispatchEvent(new Event('input', {bubbles:true}));
 				sel.dispatchEvent(new Event('change', {bubbles:true}));
 				sel.dispatchEvent(new Event('blur', {bubbles:true}));
-				return 'click-selected: '+opt.value;
+				return 'selected: '+opt.value;
 			}
 		}
 		return 'no matching select';
-	})()`, value)
-	var result string
-	if err := chromedp.Run(ctx, chromedp.Evaluate(clickJS, &result)); err == nil {
-		if !strings.Contains(result, "no matching") {
-			return
-		}
-	}
-
-	// Fallback: type into native select
-	selectors := []string{
-		`select[autocomplete="country"]`,
-		`select[name="countryCode"]`,
-		`select[name="country"]`,
-		`select[autocomplete="address-level1"]`,
-		`select[name="zone"]`,
-		`select[name="province"]`,
-	}
-	for _, sel := range selectors {
-		err := chromedp.Run(ctx,
-			chromedp.Click(sel, chromedp.ByQuery, chromedp.NodeVisible),
-			chromedp.Sleep(200*time.Millisecond),
-		)
-		if err != nil {
-			continue
-		}
-		prefix := displayName
-		if len(prefix) > 6 {
-			prefix = prefix[:6]
-		}
-		for _, ch := range prefix {
-			chromedp.Run(ctx, chromedp.KeyEvent(string(ch)))
-			time.Sleep(50 * time.Millisecond)
-		}
-		time.Sleep(200 * time.Millisecond)
-		chromedp.Run(ctx, chromedp.KeyEvent("\r"))
-		return
-	}
+	}`, value)
+	pg.Eval(js)
 }
 
-func fixValidationErrors(ctx context.Context, phone string) {
-	js := fmt.Sprintf(`(()=>{
+func clickContinueIfPresent(pg *rod.Page) bool {
+	js := `() => {
+		const btns = document.querySelectorAll('button[type="submit"], button, a.step__footer__continue-btn');
+		const patterns = ['continue', 'ship to', 'next step', 'proceed', 'continue to shipping', 'continue to payment'];
+		const stopWords = ['pay now', 'complete order', 'place order', 'submit order', 'buy now', 'confirm',
+			'additional', 'more', 'expand', 'show', 'toggle', 'select', 'add', 'apply', 'remove', 'change'];
+		for(const b of btns){
+			const txt = b.textContent.toLowerCase().trim().replace(/\s+/g, ' ');
+			if(txt.length > 60) continue;
+			if(stopWords.some(sw => txt.includes(sw))) continue;
+			if(patterns.some(kw => txt.includes(kw))){
+				b.click();
+				return 'clicked: '+txt;
+			}
+		}
+		return 'none';
+	}`
+	result := safeEval(pg, js)
+	return result != "none" && result != ""
+}
+
+func fixValidationErrors(pg *rod.Page, phone string) {
+	js := fmt.Sprintf(`() => {
 		function setNativeValue(el, val) {
 			const s = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
 			s.call(el, val);
@@ -639,439 +733,301 @@ func fixValidationErrors(ctx context.Context, phone string) {
 			}
 		});
 		return fixed.length > 0 ? 'fixed: '+fixed.join(', ') : 'none';
-	})()`, phone)
-	chromedp.Run(ctx, chromedp.Evaluate(js, nil))
+	}`, phone)
+	pg.Eval(js)
 }
 
 // ──────────────────────────────────────────────────────────────────
-// Payment iframe filling
+// Payment iframe filling — Rod makes this MUCH simpler
 // ──────────────────────────────────────────────────────────────────
 
-func fillPaymentIframe(ctx context.Context, card CardInfo) error {
-	// Wait for payment iframe
-	if err := chromedp.Run(ctx,
-		chromedp.WaitVisible(`iframe[id*="number"], iframe[src*="number-ltr"]`, chromedp.ByQuery),
-	); err != nil {
-		return fmt.Errorf("payment iframe not found: %w", err)
+func fillPaymentIframe(pg *rod.Page, card CardInfo, logPrefix string) error {
+	// Try direct (non-iframe) card inputs first — faster to fill
+	directFound := safeEval(pg, `() => {
+		const sels = [
+			'input[autocomplete="cc-number"]',
+			'input[placeholder*="card number" i]',
+			'input[name="number"][type="text"]',
+			'input[name="number"][type="tel"]',
+			'input[id*="card-number"]',
+			'input[data-current-field="number"]',
+			'input[aria-label*="card number" i]'
+		];
+		for(const sel of sels){
+			const el = document.querySelector(sel);
+			if(el && el.offsetParent !== null) return 'direct';
+		}
+		return '';
+	}`)
+	if directFound == "direct" {
+		fmt.Printf("%s Payment: using direct card inputs (no iframe)\n", logPrefix)
+		return fillPaymentDirect(pg, card, logPrefix)
 	}
 
-	// Scroll into view
-	chromedp.Run(ctx, chromedp.Evaluate(`
-		(()=>{
-			const iframe = document.querySelector('iframe[id*="number"], iframe[src*="number-ltr"]');
-			if(iframe) iframe.scrollIntoView({behavior:'instant', block:'center'});
-		})()
-	`, nil))
-	time.Sleep(200 * time.Millisecond)
-
-	// Try frame-context focus approach
-	focused := false
-	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		tree, err := page.GetFrameTree().Do(ctx)
-		if err != nil {
-			return err
+	// Wait for card number iframe
+	iframeSel := `iframe[id*="card-fields-number"], iframe[id*="number"], iframe[src*="number-ltr"], iframe[src*="card-fields"]`
+	_, err := pg.Timeout(12 * time.Second).Element(iframeSel)
+	if err != nil {
+		// Iframe not found — check for direct inputs that may have appeared late
+		directFound = safeEval(pg, `() => {
+			const sels = ['input[autocomplete="cc-number"]','input[placeholder*="card number" i]','input[name="number"]','input[id*="card-number"]','input[data-current-field="number"]'];
+			for(const sel of sels){ const el = document.querySelector(sel); if(el && el.offsetParent !== null) return 'direct'; }
+			return '';
+		}`)
+		if directFound == "direct" {
+			fmt.Printf("%s Payment: using direct card inputs (late discovery)\n", logPrefix)
+			return fillPaymentDirect(pg, card, logPrefix)
 		}
-		var cardFrameID cdp.FrameID
-		var findFrame func(ft *page.FrameTree)
-		findFrame = func(ft *page.FrameTree) {
-			if ft.Frame != nil {
-				lower := strings.ToLower(ft.Frame.URL)
-				isCardNumber := (strings.Contains(lower, "card-fields") && strings.Contains(lower, "number")) ||
-					(strings.Contains(lower, "number") && strings.Contains(lower, "ltr")) ||
-					(strings.Contains(lower, "card") && strings.Contains(lower, "number") && strings.Contains(lower, "iframe")) ||
-					(strings.Contains(lower, "payment") && strings.Contains(lower, "number")) ||
-					(strings.Contains(lower, "credit-card") && strings.Contains(lower, "number")) ||
-					(strings.Contains(lower, "shopifycs") && strings.Contains(lower, "number"))
-				if isCardNumber && cardFrameID == "" {
-					cardFrameID = ft.Frame.ID
-					return
-				}
-			}
-			for _, child := range ft.ChildFrames {
-				if cardFrameID != "" {
-					return
-				}
-				findFrame(child)
-			}
-		}
-		findFrame(tree)
-		if cardFrameID == "" {
-			return fmt.Errorf("card number frame not found")
-		}
-
-		worldID, err := page.CreateIsolatedWorld(cardFrameID).Do(ctx)
-		if err != nil {
-			return fmt.Errorf("creating isolated world: %w", err)
-		}
-
-		_, exDetail, err := runtime.Evaluate(`
-			(()=>{
-				const inp = document.querySelector('input[name="number"], input[type="text"], input[autocomplete="cc-number"], input');
-				if(inp){ inp.focus(); inp.click(); return 'focused: '+inp.name; }
-				return 'no input found';
-			})()
-		`).WithContextID(runtime.ExecutionContextID(worldID)).Do(ctx)
-		if err != nil {
-			return fmt.Errorf("focusing card input: %w", err)
-		}
-		if exDetail != nil {
-			return fmt.Errorf("focus exception: %v", exDetail)
-		}
-		focused = true
-		return nil
-	})); err != nil {
-		// Fallback: mouse click on iframe center
-		chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-			var boundsJSON string
-			chromedp.Evaluate(`
-				(()=>{
-					const iframe = document.querySelector('iframe[id*="number"], iframe[src*="number-ltr"]');
-					if(!iframe) return JSON.stringify([]);
-					const r = iframe.getBoundingClientRect();
-					return JSON.stringify([r.x, r.y, r.width, r.height]);
-				})()
-			`, &boundsJSON).Do(ctx)
-			var bounds []float64
-			if err := json.Unmarshal([]byte(boundsJSON), &bounds); err != nil || len(bounds) < 4 {
-				return nil
-			}
-			cx, cy := bounds[0]+bounds[2]/2, bounds[1]+bounds[3]/2
-			chromedp.Evaluate(`
-				(()=>{
-					const iframe = document.querySelector('iframe[id*="number"], iframe[src*="number-ltr"]');
-					if(iframe) iframe.scrollIntoView({behavior:'instant', block:'center'});
-				})()
-			`, nil).Do(ctx)
-			time.Sleep(300 * time.Millisecond)
-
-			chromedp.Evaluate(`
-				(()=>{
-					const iframe = document.querySelector('iframe[id*="number"], iframe[src*="number-ltr"]');
-					if(!iframe) return JSON.stringify([]);
-					const r = iframe.getBoundingClientRect();
-					return JSON.stringify([r.x + r.width/2, r.y + r.height/2]);
-				})()
-			`, &boundsJSON).Do(ctx)
-			json.Unmarshal([]byte(boundsJSON), &bounds)
-			if len(bounds) >= 2 {
-				cx, cy = bounds[0], bounds[1]
-			}
-
-			input.DispatchMouseEvent(input.MousePressed, cx, cy).
-				WithButton(input.Left).WithClickCount(1).Do(ctx)
-			input.DispatchMouseEvent(input.MouseReleased, cx, cy).
-				WithButton(input.Left).WithClickCount(1).Do(ctx)
-			return nil
-		}))
-		time.Sleep(500 * time.Millisecond)
+		diag := safeEval(pg, `() => {
+			const iframes = document.querySelectorAll('iframe');
+			const iInfo = [];
+			iframes.forEach((f, i) => { iInfo.push('iframe[' + i + '] id=' + (f.id||'') + ' src=' + (f.src||'').substring(0,80)); });
+			return iInfo.length > 0 ? iInfo.join(' | ') : 'NONE';
+		}`)
+		return fmt.Errorf("no card fields found after 12s. Page: %s", diag)
 	}
 
-	// Wait for card field to unlock
-	for attempt := 0; attempt < 20; attempt++ {
-		var ready string
-		chromedp.Run(ctx, chromedp.Evaluate(`
-			(()=>{
-				const iframe = document.querySelector('iframe[id*="number"], iframe[src*="number-ltr"]');
-				if(!iframe) return 'no-iframe';
-				const parent = iframe.closest('.card-fields-container, [data-card-fields], [class*="card"]');
-				if(parent){
-					const loading = parent.querySelector('.loading, [aria-busy="true"], .spinner');
-					if(loading && loading.offsetParent !== null) return 'loading';
-				}
-				const r = iframe.getBoundingClientRect();
-				if(r.height < 10) return 'collapsed';
-				return 'ready';
-			})()`, &ready))
-		if ready == "ready" || ready == "no-iframe" {
+	// Re-get iframe from parent page context
+	iframeEl, err := pg.Element(iframeSel)
+	if err != nil {
+		return fmt.Errorf("iframe re-get failed: %w", err)
+	}
+
+	// Scroll iframe into view
+	iframeEl.ScrollIntoView()
+	time.Sleep(500 * time.Millisecond)
+
+	// Wait for iframe to be fully ready
+	for attempt := 0; attempt < 5; attempt++ {
+		ready := safeEval(pg, `() => {
+			const iframe = document.querySelector('iframe[id*="number"], iframe[src*="number-ltr"], iframe[src*="card-fields"]');
+			if(!iframe) return 'no-iframe';
+			const parent = iframe.closest('.card-fields-container, [data-card-fields], [class*="card"]');
+			if(parent){
+				const loading = parent.querySelector('.loading, [aria-busy="true"], .spinner');
+				if(loading && loading.offsetParent !== null) return 'loading';
+			}
+			const r = iframe.getBoundingClientRect();
+			if(r.height < 10) return 'collapsed';
+			return 'ready';
+		}`)
+		if ready == "ready" || ready == "no-iframe" || ready == "" {
 			break
 		}
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	fmt.Printf("%s Payment: using iframe (%s)\n", logPrefix, iframeSel)
+	return fillPaymentViaIframe(pg, iframeEl, card, logPrefix)
+}
+
+// fillPaymentDirect fills card details using direct page inputs (non-iframe Shopify checkout).
+func fillPaymentDirect(pg *rod.Page, card CardInfo, logPrefix string) error {
+	result := safeEval(pg, fmt.Sprintf(`() => {
+		function setVal(el, val) {
+			const s = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+			s.call(el, val);
+			el.dispatchEvent(new Event('input', {bubbles:true}));
+			el.dispatchEvent(new Event('change', {bubbles:true}));
+			el.dispatchEvent(new Event('blur', {bubbles:true}));
+		}
+		function fill(sels, val) {
+			for(const sel of sels){
+				const el = document.querySelector(sel);
+				if(el && el.offsetParent !== null){
+					el.focus();
+					setVal(el, val);
+					return true;
+				}
+			}
+			return false;
+		}
+		const filled = [];
+		if(fill([
+			'input[autocomplete="cc-number"]',
+			'input[placeholder*="card number" i]',
+			'input[name="number"]',
+			'input[id*="card-number"]',
+			'input[data-current-field="number"]',
+			'input[aria-label*="card number" i]'
+		], %q)) filled.push('number');
+		const expCombined = %q;
+		const expMM = %q;
+		const expYY = %q;
+		if(fill([
+			'input[autocomplete="cc-exp"]',
+			'input[placeholder*="MM / YY" i]',
+			'input[placeholder*="MM/YY" i]',
+			'input[name="expiry"]',
+			'input[id*="expiry"]',
+			'input[data-current-field="expiry"]',
+			'input[aria-label*="expiration" i]'
+		], expCombined)) {
+			filled.push('expiry');
+		} else {
+			fill(['input[autocomplete="cc-exp-month"]','input[name="month"]','input[name="exp_month"]'], expMM);
+			fill(['input[autocomplete="cc-exp-year"]','input[name="year"]','input[name="exp_year"]'], expYY);
+			filled.push('exp_parts');
+		}
+		if(fill([
+			'input[autocomplete="cc-csc"]',
+			'input[placeholder*="security code" i]',
+			'input[placeholder*="CVV" i]',
+			'input[placeholder*="CVC" i]',
+			'input[name="verification_value"]',
+			'input[name="cvv"]','input[name="cvc"]',
+			'input[id*="cvv"]',
+			'input[data-current-field="verification_value"]',
+			'input[aria-label*="security" i]',
+			'input[aria-label*="CVV" i]'
+		], %q)) filled.push('cvv');
+		fill([
+			'input[autocomplete="cc-name"]',
+			'input[placeholder*="name on card" i]',
+			'input[placeholder*="cardholder" i]',
+			'input[name*="cardName" i]',
+			'input[name*="nameoncard" i]',
+			'input[data-current-field="name"]',
+			'input[aria-label*="name on card" i]',
+			'input[id*="name" i][id*="card" i]'
+		], %q);
+		filled.push('name');
+		return filled.join(',');
+	}`, card.Number, card.ExpMM+card.ExpYY, card.ExpMM, card.ExpYY, card.CVV, card.FullName))
+
+	if result == "" {
+		return fmt.Errorf("direct card fill returned empty result")
+	}
+	fmt.Printf("%s Payment direct filled: %s\n", logPrefix, result)
+	return nil
+}
+
+func fillPaymentViaIframe(pg *rod.Page, iframeEl *rod.Element, card CardInfo, logPrefix string) error {
+	iframeSel := `iframe[id*="card-fields-number"], iframe[id*="number"], iframe[src*="number-ltr"], iframe[src*="card-fields"]`
+	var cardFrame *rod.Page
+	const maxFrameAttempts = 3
+	for attempt := 0; attempt < maxFrameAttempts; attempt++ {
+		tmpEl, err := pg.Timeout(3 * time.Second).Element(iframeSel)
+		if err != nil {
+			fmt.Printf("%s Frame() attempt %d: iframe element not found\n", logPrefix, attempt+1)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		type frameResult struct {
+			frame *rod.Page
+			err   error
+		}
+		frameCh := make(chan frameResult, 1)
+		go func() {
+			f, e := tmpEl.Frame()
+			frameCh <- frameResult{f, e}
+		}()
+		select {
+		case fr := <-frameCh:
+			if fr.err != nil {
+				fmt.Printf("%s Frame() attempt %d failed: %v\n", logPrefix, attempt+1, fr.err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			cardFrame = fr.frame
+		case <-time.After(5 * time.Second):
+			fmt.Printf("%s Frame() attempt %d timed out after 5s\n", logPrefix, attempt+1)
+			continue
+		}
+		if cardFrame != nil {
+			break
+		}
+	}
+	if cardFrame == nil {
+		return fmt.Errorf("failed to access card frame after %d attempts", maxFrameAttempts)
+	}
+
+	// Find card number input inside the iframe
+	cardInput, err := cardFrame.Timeout(8 * time.Second).Element(`input[name="number"], input[autocomplete="cc-number"], input[type="text"], input`)
+	if err != nil {
+		return fmt.Errorf("card number input not found in iframe: %w", err)
+	}
+	cardInput, _ = cardFrame.Element(`input[name="number"], input[autocomplete="cc-number"], input[type="text"], input`)
+
+	// Click to focus, then type character by character via real keyboard events
+	cardInput.Click(proto.InputMouseButtonLeft, 1)
+	time.Sleep(100 * time.Millisecond)
+	cardInput.SelectAllText()
+	time.Sleep(50 * time.Millisecond)
+	pg.Keyboard.Press(input.Backspace)
+	time.Sleep(50 * time.Millisecond)
+
+	// Type card number
+	fmt.Printf("%s Typing card number...\n", logPrefix)
+	for _, ch := range card.Number {
+		pg.Keyboard.Type(input.Key(ch))
+		time.Sleep(15 * time.Millisecond)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// Tab to expiry field — browser natively handles cross-iframe tabbing
+	fmt.Printf("%s Tabbing to expiry...\n", logPrefix)
+	pg.Keyboard.Press(input.Tab)
+	time.Sleep(300 * time.Millisecond)
+
+	// Type expiry
+	expiry := card.ExpMM + card.ExpYY
+	for _, ch := range expiry {
+		pg.Keyboard.Type(input.Key(ch))
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// Tab to CVV field
+	fmt.Printf("%s Tabbing to CVV...\n", logPrefix)
+	pg.Keyboard.Press(input.Tab)
+	time.Sleep(300 * time.Millisecond)
+
+	// Type CVV
+	for _, ch := range card.CVV {
+		pg.Keyboard.Type(input.Key(ch))
+		time.Sleep(50 * time.Millisecond)
 	}
 	time.Sleep(150 * time.Millisecond)
 
-	// Re-focus after unlock if using frame context approach
-	if focused {
-		chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-			tree, err := page.GetFrameTree().Do(ctx)
-			if err != nil {
-				return nil
-			}
-			var cardFrameID cdp.FrameID
-			var findFrame func(ft *page.FrameTree)
-			findFrame = func(ft *page.FrameTree) {
-				if ft.Frame != nil {
-					lower := strings.ToLower(ft.Frame.URL)
-					isCard := (strings.Contains(lower, "card-fields") && strings.Contains(lower, "number")) ||
-						(strings.Contains(lower, "number") && strings.Contains(lower, "ltr")) ||
-						(strings.Contains(lower, "payment") && strings.Contains(lower, "number"))
-					if isCard && cardFrameID == "" {
-						cardFrameID = ft.Frame.ID
-					}
-				}
-				for _, child := range ft.ChildFrames {
-					if cardFrameID == "" {
-						findFrame(child)
-					}
-				}
-			}
-			findFrame(tree)
-			if cardFrameID == "" {
-				return nil
-			}
-			worldID, err := page.CreateIsolatedWorld(cardFrameID).Do(ctx)
-			if err != nil {
-				return nil
-			}
-			runtime.Evaluate(`
-				(()=>{
-					const inp = document.querySelector('input[name="number"], input[type="text"], input[autocomplete="cc-number"], input');
-					if(inp){ inp.focus(); inp.click(); }
-				})()
-			`).WithContextID(runtime.ExecutionContextID(worldID)).Do(ctx)
-			return nil
-		}))
-	}
-	time.Sleep(100 * time.Millisecond)
-
-	// Type card number
-	typeKeys := func(value string) {
-		for _, ch := range value {
-			chromedp.Run(ctx, chromedp.KeyEvent(string(ch)))
-			time.Sleep(5 * time.Millisecond)
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	typeKeys(card.Number)
-
-	// Verify card number was typed
-	cardVerify := verifyCardInput(ctx)
-	if len(cardVerify) == 0 {
-		time.Sleep(500 * time.Millisecond)
-		cardVerify = verifyCardInput(ctx)
-	}
-	if len(cardVerify) == 0 {
-		// Retry with click+focus
-		chromedp.Run(ctx, chromedp.KeyEvent("a", chromedp.KeyModifiers(input.ModifierCtrl)))
-		chromedp.Run(ctx, chromedp.KeyEvent("\b"))
-		time.Sleep(100 * time.Millisecond)
-		chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-			chromedp.Click(`iframe[id*="number"], iframe[src*="number-ltr"]`, chromedp.ByQuery).Do(ctx)
-			time.Sleep(200 * time.Millisecond)
-			var nodes []*cdp.Node
-			if err := chromedp.Nodes(`iframe[id*="number"], iframe[src*="number-ltr"]`, &nodes, chromedp.ByQuery).Do(ctx); err == nil && len(nodes) > 0 {
-				iframeNode := nodes[0]
-				if iframeNode.ContentDocument != nil && iframeNode.ContentDocument.Children != nil {
-					var findInput func(n *cdp.Node) *cdp.Node
-					findInput = func(n *cdp.Node) *cdp.Node {
-						if n.NodeName == "INPUT" {
-							return n
-						}
-						for _, child := range n.Children {
-							if found := findInput(child); found != nil {
-								return found
-							}
-						}
-						return nil
-					}
-					if inp := findInput(iframeNode.ContentDocument); inp != nil {
-						chromedp.Run(ctx, chromedp.MouseClickNode(inp))
-						time.Sleep(200 * time.Millisecond)
-					}
-				}
-			}
-			return nil
-		}))
-		time.Sleep(200 * time.Millisecond)
-		chromedp.Run(ctx, chromedp.KeyEvent("a", chromedp.KeyModifiers(input.ModifierCtrl)))
-		chromedp.Run(ctx, chromedp.KeyEvent("\b"))
-		time.Sleep(100 * time.Millisecond)
-		typeKeys(card.Number)
-	}
-
-	// Tab to expiry, type it
-	chromedp.Run(ctx, chromedp.KeyEvent("\t"))
-	time.Sleep(50 * time.Millisecond)
-	typeKeys(card.ExpMM + card.ExpYY)
-
-	// Tab to CVV, type it
-	chromedp.Run(ctx, chromedp.KeyEvent("\t"))
-	time.Sleep(50 * time.Millisecond)
-	typeKeys(card.CVV)
-
-	// Fill name on card
-	fillNameOnCard(ctx, card.FullName)
+	// Fill name on card on main page only
+	fillNameOnCard(pg, card.FullName, logPrefix)
 
 	return nil
 }
 
-func verifyCardInput(ctx context.Context) string {
-	var cardVerify string
-	chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		tree, err := page.GetFrameTree().Do(ctx)
-		if err != nil {
-			return nil
+func fillNameOnCard(pg *rod.Page, name string, logPrefix string) {
+	safeEval(pg, fmt.Sprintf(`() => {
+		const sels = [
+			'input[autocomplete="cc-name"]',
+			'input[placeholder*="name on card" i]',
+			'input[placeholder*="cardholder" i]',
+			'input[name*="cardName" i]',
+			'input[name*="nameoncard" i]',
+			'input[id*="name" i][id*="card" i]',
+			'input[aria-label*="name on card" i]',
+			'input[data-current-field="name"]',
+			'input[autocomplete="ccname"]',
+			'input[name="name"]'
+		];
+		function setVal(el, val) {
+			const s = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+			s.call(el, val);
+			el.dispatchEvent(new Event('input', {bubbles:true}));
+			el.dispatchEvent(new Event('change', {bubbles:true}));
+			el.dispatchEvent(new Event('blur', {bubbles:true}));
 		}
-		var checkFrame func(ft *page.FrameTree)
-		checkFrame = func(ft *page.FrameTree) {
-			if ft.Frame != nil && cardVerify == "" {
-				worldID, err := page.CreateIsolatedWorld(ft.Frame.ID).Do(ctx)
-				if err == nil {
-					res, _, err := runtime.Evaluate(`
-						(()=>{
-							const inp = document.querySelector('input[name="number"], input[autocomplete="cc-number"], input[id*="number"]');
-							if(inp) return inp.value;
-							return '';
-						})()
-					`).WithContextID(runtime.ExecutionContextID(worldID)).Do(ctx)
-					if err == nil && res != nil && res.Value != nil {
-						val := strings.Trim(string(res.Value), `"`)
-						if len(val) > 0 {
-							cardVerify = val
-						}
-					}
-				}
-			}
-			for _, child := range ft.ChildFrames {
-				if cardVerify == "" {
-					checkFrame(child)
-				}
-			}
+		for(const sel of sels){
+			const el = document.querySelector(sel);
+			if(el){ el.focus(); setVal(el, %q); return 'filled'; }
 		}
-		checkFrame(tree)
-		return nil
-	}))
-	return cardVerify
+		return 'not found';
+	}`, name))
 }
 
-func fillNameOnCard(ctx context.Context, name string) {
-	var nameFocused string
-	chromedp.Run(ctx, chromedp.Evaluate(`
-		(()=>{
-			const sels = [
-				'input[autocomplete="cc-name"]',
-				'input[placeholder*="name on card" i]',
-				'input[placeholder*="cardholder" i]',
-				'input[name*="cardName" i]',
-				'input[name*="nameoncard" i]',
-				'input[id*="name" i][id*="card" i]',
-				'input[aria-label*="name on card" i]',
-				'input[data-current-field="name"]',
-				'input[autocomplete="ccname"]',
-				'input[name="name"]'
-			];
-			function focusAndSelect(inp) {
-				inp.scrollIntoView({behavior:'instant', block:'center'});
-				inp.focus();
-				inp.click();
-				try { inp.select(); } catch(e){}
-				try { inp.setSelectionRange(0, 99999); } catch(e){}
-				try { document.execCommand('selectAll'); } catch(e){}
-			}
-			for(const label of document.querySelectorAll('label')){
-				try {
-					const lt = label.textContent.toLowerCase();
-					if(lt.includes('name on card') || lt.includes('cardholder')){
-						const forId = label.getAttribute('for');
-						const inp = forId ? document.getElementById(forId) : label.querySelector('input');
-						if(inp){
-							focusAndSelect(inp);
-							return 'focused via label: '+lt.trim();
-						}
-					}
-				} catch(e){}
-			}
-			for(const sel of sels){
-				try {
-					const el = document.querySelector(sel);
-					if(el){
-						focusAndSelect(el);
-						return 'focused: '+sel;
-					}
-				} catch(e){}
-			}
-			return 'not found';
-		})()
-	`, &nameFocused))
-
-	typeKeys := func(value string) {
-		for _, ch := range value {
-			chromedp.Run(ctx, chromedp.KeyEvent(string(ch)))
-			time.Sleep(5 * time.Millisecond)
-		}
-	}
-
-	if strings.HasPrefix(nameFocused, "focused") {
-		time.Sleep(50 * time.Millisecond)
-		// Triple-click to select all, then type
-		chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-			var boundsJSON string
-			chromedp.Evaluate(`
-				(()=>{
-					const el = document.activeElement;
-					if(!el) return JSON.stringify([]);
-					const r = el.getBoundingClientRect();
-					return JSON.stringify([r.x + r.width/2, r.y + r.height/2]);
-				})()
-			`, &boundsJSON).Do(ctx)
-			var coords []float64
-			if err := json.Unmarshal([]byte(boundsJSON), &coords); err == nil && len(coords) == 2 {
-				cx, cy := coords[0], coords[1]
-				input.DispatchMouseEvent(input.MousePressed, cx, cy).
-					WithButton(input.Left).WithClickCount(3).Do(ctx)
-				input.DispatchMouseEvent(input.MouseReleased, cx, cy).
-					WithButton(input.Left).WithClickCount(3).Do(ctx)
-			}
-			return nil
-		}))
-		time.Sleep(100 * time.Millisecond)
-		typeKeys(name)
-	} else {
-		// Try iframe fallback
-		chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-			tree, err := page.GetFrameTree().Do(ctx)
-			if err != nil {
-				return nil
-			}
-			var nameFrameID cdp.FrameID
-			var findFrame func(ft *page.FrameTree)
-			findFrame = func(ft *page.FrameTree) {
-				if ft.Frame != nil && nameFrameID == "" {
-					lower := strings.ToLower(ft.Frame.URL)
-					if (strings.Contains(lower, "card-fields") || strings.Contains(lower, "card")) &&
-						strings.Contains(lower, "name") {
-						nameFrameID = ft.Frame.ID
-					}
-				}
-				for _, child := range ft.ChildFrames {
-					if nameFrameID == "" {
-						findFrame(child)
-					}
-				}
-			}
-			findFrame(tree)
-			if nameFrameID != "" {
-				worldID, err := page.CreateIsolatedWorld(nameFrameID).Do(ctx)
-				if err != nil {
-					return nil
-				}
-				runtime.Evaluate(`
-					(()=>{
-						const inp = document.querySelector('input[name="name"], input[autocomplete="cc-name"], input[type="text"], input');
-						if(inp){ inp.focus(); inp.click(); }
-					})()
-				`).WithContextID(runtime.ExecutionContextID(worldID)).Do(ctx)
-				return nil
-			}
-			return nil
-		}))
-		time.Sleep(200 * time.Millisecond)
-		typeKeys(name)
-	}
-}
-
-func clickPayButton(ctx context.Context) error {
-	js := `(()=>{
+func clickPayButton(pg *rod.Page) {
+	pg.Eval(`() => {
 		const btns = document.querySelectorAll('button[type="submit"], button, input[type="submit"]');
 		const payKeywords = ['pay now', 'complete order', 'place order', 'submit order', 'buy now',
 			'confirm order', 'place your order', 'checkout', 'finalize'];
@@ -1101,20 +1057,11 @@ func clickPayButton(ctx context.Context) error {
 			return 'clicked last submit';
 		}
 		return 'no pay button found';
-	})()`
-	var result string
-	if err := chromedp.Run(ctx, chromedp.Evaluate(js, &result)); err != nil {
-		return err
-	}
-	return nil
+	}`)
 }
 
-func injectFetchInterceptor(ctx context.Context) {
-	// No-op — uses Performance API re-fetch approach
-}
-
-func checkCardValidationError(ctx context.Context) string {
-	js := `(()=>{
+func checkCardValidationError(pg *rod.Page) string {
+	result := safeEval(pg, `() => {
 		const body = document.body ? document.body.innerText.toLowerCase() : '';
 		if(body.includes('enter a valid card number') || body.includes('invalid card number')) {
 			const all = document.querySelectorAll('*');
@@ -1129,166 +1076,216 @@ func checkCardValidationError(ctx context.Context) string {
 			return 'Enter a valid card number';
 		}
 		return '';
-	})()`
-
-	var errText string
-	if err := chromedp.Run(ctx, chromedp.Evaluate(js, &errText)); err == nil && errText != "" {
-		return errText
-	}
-
-	// Check frames via CDP
-	chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		tree, err := page.GetFrameTree().Do(ctx)
-		if err != nil {
-			return nil
-		}
-		var checkFrame func(ft *page.FrameTree)
-		checkFrame = func(ft *page.FrameTree) {
-			if ft.Frame != nil && errText == "" {
-				worldID, err := page.CreateIsolatedWorld(ft.Frame.ID).Do(ctx)
-				if err == nil {
-					res, _, err := runtime.Evaluate(`
-						(()=>{
-							const body = document.body ? document.body.innerText.toLowerCase() : '';
-							if(body.includes('valid card number') || body.includes('invalid card')) {
-								return document.body.innerText.trim().substring(0, 200);
-							}
-							return '';
-						})()
-					`).WithContextID(runtime.ExecutionContextID(worldID)).Do(ctx)
-					if err == nil && res != nil && res.Value != nil {
-						val := strings.Trim(string(res.Value), `"`)
-						if len(val) > 0 {
-							errText = val
-						}
-					}
-				}
-			}
-			for _, child := range ft.ChildFrames {
-				if errText == "" {
-					checkFrame(child)
-				}
-			}
-		}
-		checkFrame(tree)
-		return nil
-	}))
-
-	return errText
+	}`)
+	return result
 }
 
 // ──────────────────────────────────────────────────────────────────
-// Wait for checkout result (success / declined / 3DS / error)
+// Wait for checkout result
 // ──────────────────────────────────────────────────────────────────
 
-func waitForCheckoutResult(ctx context.Context, logPrefix string) CheckResult {
+func waitForCheckoutResult(pg *rod.Page, logPrefix string, capMu *sync.Mutex, captures *[]paymentCapture) CheckResult {
 	result := CheckResult{Status: "error"}
-	deadline := time.Now().Add(20 * time.Second) // shorter timeout for batch mode
+	resultStart := time.Now()
+	deadline := time.Now().Add(35 * time.Second)
+	maxDeadline := time.Now().Add(60 * time.Second)
+	var totalExtended time.Duration
 	lastURL := ""
+	var threedsDetectedAt time.Time
+	const threedsTimeout = 15 * time.Second
+
+	const pollJS = `() => {
+		const r = {url: location.href, card_err: '', errors: '', proc: 'idle'};
+		const body = document.body ? document.body.innerText.toLowerCase() : '';
+		if(body.includes('enter a valid card number') || body.includes('invalid card number')) {
+			const all = document.querySelectorAll('p, span, div');
+			for(const el of all){
+				const t = el.textContent.trim().toLowerCase();
+				if((t.includes('valid card number') || t.includes('invalid card number')) && t.length < 100){
+					r.card_err = el.textContent.trim(); break;
+				}
+			}
+			if(!r.card_err) r.card_err = 'Enter a valid card number';
+		}
+		const sels = ['[role="alert"]','.notice--error','.field__message--error','[data-error]',
+			'.banner--error','.banner__content','[class*="error-message"]',
+			'[class*="payment-error"]','.section__content [class*="error"]',
+			'[data-step="payment_method"] [role="status"]',
+			'[class*="notice"]','[class*="flash"]','.checkout-error',
+			'p[class*="error"]','span[class*="error"]','div[class*="error"]'];
+		const texts = new Set();
+		for(const sel of sels){
+			document.querySelectorAll(sel).forEach(el => {
+				const t = el.textContent.trim();
+				if(t && t.length > 3 && t.length < 500) texts.add(t);
+			});
+		}
+		r.errors = Array.from(texts).join(' | ');
+		const overlay = document.querySelector('[class*="processing"],[class*="loading-overlay"],[class*="spinner"]');
+		if(overlay && overlay.offsetParent !== null){ r.proc = 'processing'; }
+		else {
+			const btn = document.querySelector('[data-pay-button],button[type="submit"],#checkout-pay-button');
+			if(btn && (btn.disabled || btn.getAttribute('aria-busy')==='true')) r.proc = 'processing';
+			if(document.body && document.body.classList.contains('order-summary--is-loading')) r.proc = 'processing';
+		}
+		return JSON.stringify(r);
+	}`
+
+	type pollState struct {
+		URL     string `json:"url"`
+		CardErr string `json:"card_err"`
+		Errors  string `json:"errors"`
+		Proc    string `json:"proc"`
+	}
 
 	for time.Now().Before(deadline) {
-		var currentURL string
-		if err := chromedp.Run(ctx, chromedp.Location(&currentURL)); err != nil {
-			break
+		raw := safeEval(pg, pollJS)
+		var ps pollState
+		json.Unmarshal([]byte(raw), &ps)
+
+		if ps.URL != lastURL && ps.URL != "" {
+			fmt.Printf("%s URL: %s\n", logPrefix, ps.URL)
+			lastURL = ps.URL
 		}
 
-		if currentURL != lastURL {
-			fmt.Printf("%s URL: %s\n", logPrefix, currentURL)
-			lastURL = currentURL
-		}
-
-		// Success indicators
-		if strings.Contains(currentURL, "thank_you") || strings.Contains(currentURL, "thank-you") ||
-			strings.Contains(currentURL, "orders/") || strings.Contains(currentURL, "order-confirmation") ||
-			strings.Contains(currentURL, "confirmation") {
+		// Success indicators in URL
+		if strings.Contains(ps.URL, "thank_you") || strings.Contains(ps.URL, "thank-you") ||
+			strings.Contains(ps.URL, "orders/") || strings.Contains(ps.URL, "order-confirmation") ||
+			strings.Contains(ps.URL, "confirmation") {
 			result.Status = "success"
-			// Try to extract order number from API responses
-			apiResult := readPaymentAPIResponses(ctx)
-			if apiResult.OrderNumber != "" {
-				result.OrderNumber = apiResult.OrderNumber
-			}
 			return result
 		}
 
 		// Card validation errors
-		if cardErr := checkCardValidationError(ctx); cardErr != "" {
+		if ps.CardErr != "" {
 			result.Status = "declined"
 			result.ErrorCode = "INCORRECT_NUMBER"
-			result.ErrorMessage = cardErr
+			result.ErrorMessage = ps.CardErr
 			return result
 		}
 
-		// Payment errors
-		var errorText string
-		chromedp.Run(ctx, chromedp.Evaluate(`
-			(()=>{
-				const errs = document.querySelectorAll('[role="alert"], .notice--error, .field__message--error, [data-error]');
-				return Array.from(errs).map(e => e.textContent.trim()).filter(t => t).join(' | ');
-			})()
-		`, &errorText))
-
-		if errorText != "" {
-			lower := strings.ToLower(errorText)
+		// Check broad page body text for decline/error messages
+		if ps.Errors != "" {
+			lower := strings.ToLower(ps.Errors)
 			if strings.Contains(lower, "order") && strings.Contains(lower, "being processed") {
-				// Not an error
+				// Still processing — keep waiting
 			} else if strings.Contains(lower, "captcha") {
-				result.Status = "error"
-				result.ErrorCode = "CAPTCHA"
-				result.ErrorMessage = errorText
+				result.Status = "declined"
+				result.ErrorCode = "CARD_DECLINED"
+				result.ErrorMessage = ps.Errors
 				return result
-			} else if strings.Contains(lower, "3d secure") || strings.Contains(lower, "3ds") ||
-				strings.Contains(lower, "authentication") || strings.Contains(lower, "redirect") {
-				// Wait for 3DS — but only up to 20s in batch mode
-				if time.Now().Add(20 * time.Second).Before(deadline) {
-					// Still have time, wait
-				} else {
+			} else if strings.Contains(lower, "3d secure") || strings.Contains(lower, "3ds") {
+				if threedsDetectedAt.IsZero() {
+					threedsDetectedAt = time.Now()
+					fmt.Printf("%s 3DS challenge detected, starting %ds timeout\n", logPrefix, int(threedsTimeout.Seconds()))
+				} else if time.Since(threedsDetectedAt) > threedsTimeout {
 					result.Status = "3ds"
-					result.ErrorCode = "3DS_CHALLENGE"
-					result.ErrorMessage = errorText
+					result.ErrorCode = "THREE_DS"
+					result.ErrorMessage = "3DS challenge not resolved within timeout"
 					return result
 				}
+			} else if strings.Contains(lower, "problem with our checkout") ||
+				strings.Contains(lower, "refresh this page") ||
+				strings.Contains(lower, "try again in a few minutes") ||
+				strings.Contains(lower, "something went wrong") {
+				// Transient Shopify message — keep waiting
+			} else if strings.Contains(lower, "checkout is unavailable") {
+				result.Status = "error"
+				result.ErrorCode = "CHECKOUT_FAILED"
+				result.ErrorMessage = ps.Errors
+				return result
 			} else if strings.Contains(lower, "issue processing") ||
 				strings.Contains(lower, "problem processing") ||
 				strings.Contains(lower, "unable to process") ||
 				strings.Contains(lower, "payment method") ||
-				strings.Contains(lower, "try again") ||
 				strings.Contains(lower, "card was declined") ||
-				strings.Contains(lower, "transaction failed") {
+				strings.Contains(lower, "transaction failed") ||
+				strings.Contains(lower, "declined") ||
+				strings.Contains(lower, "not accepted") ||
+				strings.Contains(lower, "insufficient funds") ||
+				strings.Contains(lower, "do not honor") ||
+				strings.Contains(lower, "lost card") ||
+				strings.Contains(lower, "stolen card") ||
+				strings.Contains(lower, "expired card") ||
+				strings.Contains(lower, "invalid card") ||
+				strings.Contains(lower, "card number is invalid") ||
+				strings.Contains(lower, "security code is incorrect") ||
+				strings.Contains(lower, "couldn't process") ||
+				strings.Contains(lower, "could not process") ||
+				strings.Contains(lower, "payment can't be processed") ||
+				strings.Contains(lower, "session has expired") {
 				result.Status = "declined"
 				result.ErrorCode = "CARD_DECLINED"
-				result.ErrorMessage = errorText
-				// Try to get more specific error from API
-				apiResult := readPaymentAPIResponses(ctx)
-				if apiResult.ErrorCode != "" {
-					result.ErrorCode = apiResult.ErrorCode
-				}
-				if apiResult.ErrorMessage != "" {
-					result.ErrorMessage = apiResult.ErrorMessage
-				}
-				return result
-			} else {
-				result.Status = "declined"
-				result.ErrorCode = "UNKNOWN_ERROR"
-				result.ErrorMessage = errorText
+				result.ErrorMessage = ps.Errors
 				return result
 			}
+		}
+
+		// Check CDP captures for a definitive API result
+		if capMu != nil && captures != nil {
+			capMu.Lock()
+			capCopy := make([]paymentCapture, len(*captures))
+			copy(capCopy, *captures)
+			capMu.Unlock()
+			if len(capCopy) > 0 {
+				apiResult := parseCapturedResponses(capCopy)
+				if apiResult.Status == "success" {
+					result.Status = "success"
+					result.OrderNumber = apiResult.OrderNumber
+					fmt.Printf("%s CDP capture: success (order=%s)\n", logPrefix, apiResult.OrderNumber)
+					return result
+				} else if apiResult.ErrorCode != "" {
+					result.Status = apiResult.Status
+					result.ErrorCode = apiResult.ErrorCode
+					result.ErrorMessage = apiResult.ErrorMessage
+					fmt.Printf("%s CDP capture: %s (%s)\n", logPrefix, apiResult.Status, apiResult.ErrorCode)
+					return result
+				}
+			}
+		}
+
+		if ps.Proc == "processing" {
+			if !threedsDetectedAt.IsZero() && time.Since(threedsDetectedAt) > threedsTimeout {
+				result.Status = "3ds"
+				result.ErrorCode = "THREE_DS"
+				result.ErrorMessage = "3DS challenge not resolved within timeout"
+				return result
+			}
+			if totalExtended < 60*time.Second {
+				ext := 15 * time.Second
+				newDeadline := deadline.Add(ext)
+				if newDeadline.Before(maxDeadline) {
+					deadline = newDeadline
+					totalExtended += ext
+					fmt.Printf("%s Processing detected, extended deadline (+%ds total)\n", logPrefix, int(totalExtended.Seconds()))
+				}
+			}
+			time.Sleep(300 * time.Millisecond)
+			continue
 		}
 
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// Timeout — try reading API responses
-	apiResult := readPaymentAPIResponses(ctx)
-	if apiResult.Status != "" {
-		result.Status = apiResult.Status
-		result.ErrorCode = apiResult.ErrorCode
-		result.ErrorMessage = apiResult.ErrorMessage
-		result.OrderNumber = apiResult.OrderNumber
+	// Final attempt — one last combined poll
+	raw := safeEval(pg, pollJS)
+	var finalPS pollState
+	json.Unmarshal([]byte(raw), &finalPS)
+
+	lowerFinal := strings.ToLower(finalPS.Errors)
+	if strings.Contains(lowerFinal, "thank you") || strings.Contains(lowerFinal, "order confirmed") {
+		result.Status = "success"
+		return result
+	}
+	if strings.Contains(lowerFinal, "declined") || strings.Contains(lowerFinal, "card was declined") {
+		result.Status = "declined"
+		result.ErrorCode = "CARD_DECLINED"
+		result.ErrorMessage = "detected decline in page text"
 		return result
 	}
 
 	result.ErrorCode = "TIMEOUT"
-	result.ErrorMessage = "no result within timeout"
+	result.ErrorMessage = fmt.Sprintf("no result within %ds", int(time.Since(resultStart).Seconds()))
 	return result
 }
 
@@ -1299,49 +1296,11 @@ type apiParseResult struct {
 	OrderNumber  string
 }
 
-func readPaymentAPIResponses(ctx context.Context) apiParseResult {
-	js := `
-		(async () => {
-			const entries = performance.getEntriesByType('resource')
-				.filter(e => e.name.includes('PollForReceipt') || e.name.includes('SubmitForCompletion'));
-			const results = [];
-			for (const entry of entries) {
-				try {
-					const resp = await fetch(entry.name, {
-						headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}
-					});
-					const body = await resp.text();
-					results.push({url: entry.name.substring(0, 200), status: resp.status, body: body});
-				} catch(e) {
-					results.push({url: entry.name.substring(0, 200), error: e.message});
-				}
-			}
-			return JSON.stringify(results);
-		})()
-	`
-
-	var raw string
-	if err := chromedp.Run(ctx, chromedp.Evaluate(js, &raw, func(p *runtime.EvaluateParams) *runtime.EvaluateParams {
-		return p.WithAwaitPromise(true)
-	})); err != nil || raw == "" || raw == "[]" {
-		return apiParseResult{}
-	}
-
-	var responses []map[string]interface{}
-	if err := json.Unmarshal([]byte(raw), &responses); err != nil {
-		return apiParseResult{}
-	}
-
+func parseCapturedResponses(captures []paymentCapture) apiParseResult {
 	var result apiParseResult
-	for _, r := range responses {
-		body, ok := r["body"]
-		if !ok {
-			continue
-		}
-		bodyStr := fmt.Sprintf("%v", body)
-
+	for _, c := range captures {
 		var parsed map[string]interface{}
-		if err := json.Unmarshal([]byte(bodyStr), &parsed); err != nil {
+		if err := json.Unmarshal([]byte(c.Body), &parsed); err != nil {
 			continue
 		}
 		data, _ := parsed["data"].(map[string]interface{})
@@ -1351,6 +1310,28 @@ func readPaymentAPIResponses(ctx context.Context) apiParseResult {
 		receipt, _ := data["receipt"].(map[string]interface{})
 		if receipt == nil {
 			continue
+		}
+
+		if typeName, ok := receipt["__typename"].(string); ok {
+			if typeName == "ProcessingReceipt" {
+				continue
+			}
+		}
+
+		if procErr, ok := receipt["processingError"].(map[string]interface{}); ok {
+			code, _ := procErr["code"].(string)
+			msg, _ := procErr["messageUntranslated"].(string)
+			if code != "" {
+				result.ErrorCode = code
+				result.ErrorMessage = msg
+				if code == "CAPTCHA_REQUIRED" {
+					result.Status = "declined"
+					result.ErrorCode = "CARD_DECLINED"
+				} else {
+					result.Status = "declined"
+				}
+				return result
+			}
 		}
 
 		orderStatus, _ := receipt["orderCreationStatus"].(map[string]interface{})
@@ -1369,19 +1350,17 @@ func readPaymentAPIResponses(ctx context.Context) apiParseResult {
 			return result
 		}
 
-		// Check for 3DS
-		if strings.Contains(bodyStr, "CompletePaymentChallenge") ||
-			strings.Contains(bodyStr, "THREE_D_SECURE") ||
-			strings.Contains(bodyStr, "ThreeDSecure") {
+		if strings.Contains(c.Body, "CompletePaymentChallenge") ||
+			strings.Contains(c.Body, "THREE_D_SECURE") ||
+			strings.Contains(c.Body, "ThreeDSecure") {
 			result.Status = "3ds"
 			result.ErrorCode = "3DS_CHALLENGE"
 			result.ErrorMessage = "3D Secure authentication required"
 			return result
 		}
 
-		// Extract error codes
 		result.Status = "declined"
-		for searchStr := bodyStr; ; {
+		for searchStr := c.Body; ; {
 			idx := strings.Index(searchStr, `"code":"`)
 			if idx < 0 {
 				break
@@ -1394,26 +1373,9 @@ func readPaymentAPIResponses(ctx context.Context) apiParseResult {
 			result.ErrorCode = searchStr[start : start+end]
 			searchStr = searchStr[start+end:]
 		}
-		for searchStr := bodyStr; ; {
-			idx := strings.Index(searchStr, `"message":"`)
-			if idx < 0 {
-				break
-			}
-			start := idx + 11
-			end := strings.Index(searchStr[start:], `"`)
-			if end < 0 {
-				break
-			}
-			msg := searchStr[start : start+end]
-			if len(msg) > 0 && len(msg) < 200 {
-				result.ErrorMessage = msg
-			}
-			searchStr = searchStr[start+end:]
-		}
 		if result.ErrorCode != "" {
 			return result
 		}
 	}
-
 	return result
 }
